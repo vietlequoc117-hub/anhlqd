@@ -985,23 +985,13 @@ if __name__ == "__main__":
                 <div className="w-12 h-12 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
                   <FileSpreadsheet className="w-6 h-6" />
                 </div>
-                <div className="text-base font-bold text-slate-900">
-                  {excelData ? (
-                    <span>
-                      Đã nạp file nguồn:{" "}
-                      <span className="text-emerald-700 font-mono">{excelData.fileName}</span>
-                    </span>
-                  ) : (
-                    <span>
-                      Kéo &amp; thả file Excel nguồn (.xlsx) vào đây hoặc bấm để chọn file
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-slate-500 leading-relaxed">
-                  Bảo toàn 100% dòng tiêu đề trường/sở (hàng 1–4), merged cells, độ rộng cột, font
-                  chữ và viền kẻ bảng.
-                </p>
-                <div className="pt-1">
+                {excelData && (
+                  <div className="text-base font-bold text-slate-900">
+                    Đã nạp file nguồn:{" "}
+                    <span className="text-emerald-700 font-mono">{excelData.fileName}</span>
+                  </div>
+                )}
+                <div>
                   <span className="px-4 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-lg hover:bg-emerald-100 transition-colors inline-flex items-center gap-1.5">
                     <Upload className="w-3.5 h-3.5" />
                     <span>
@@ -1324,12 +1314,8 @@ if __name__ == "__main__":
                       className="max-w-full h-auto border border-slate-300 bg-white transition-transform duration-150"
                     />
                   ) : (
-                    <div className="my-auto text-center p-8 space-y-3">
+                    <div className="my-auto text-center p-8 space-y-4">
                       <ScanText className="w-8 h-8 text-slate-400 mx-auto" />
-                      <div className="text-sm font-semibold text-slate-700">
-                        Tải ảnh chụp "PHIẾU CHẤM BÀI THI"
-                      </div>
-                      
                       <button
                         type="button"
                         onClick={() => imageInputRef.current?.click()}
@@ -1499,16 +1485,11 @@ if __name__ == "__main__":
                           ))}
                         </div>
                       ) : ocrRecords.length === 0 ? (
-                        <div className="p-12 text-center space-y-3">
+                        <div className="p-12 text-center space-y-4">
                           <div className="text-sm font-semibold text-slate-700">
                             Chưa có dữ liệu điểm nào
                           </div>
-                          <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                            Tải ảnh Phiếu Chấm Bài Thi để quét bằng{" "}
-                            <strong>OCR Nội Bộ</strong> hoặc bấm nút
-                            bên dưới để gõ điểm trực tiếp theo danh sách SBD.
-                          </p>
-                          <div className="flex items-center justify-center gap-3 pt-1">
+                          <div className="flex items-center justify-center gap-3">
                             <button
                               type="button"
                               onClick={() => imageInputRef.current?.click()}
