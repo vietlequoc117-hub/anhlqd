@@ -88,7 +88,7 @@ export default async function handler(req: any, res: any) {
     const MODEL_POOL = [
       "gemini-3.1-flash-lite",
       "gemini-2.5-flash",
-      "gemini-2.0-flash",
+      "gemini-3.1-flash-lite",
     ];
 
     const knownCanonicalMap = new Map<string, string>();

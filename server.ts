@@ -593,11 +593,11 @@ NHIỆM VỤ BẮT BUỘC:
    - Nếu trong ô điểm có số bị gạch xóa (gạch đè lên chữ số bên trái) và viết điểm đúng ở bên phải (ví dụ dòng K6.033 gạch bỏ số cũ và viết "6,3" ở bên phải), BẮT BUỘC lấy điểm viết lại không bị gạch xóa ("6,3" -> 6.3).
    - Nếu dòng nào ô "ĐIỂM BẰNG SỐ" hoàn toàn để trống chưa chấm điểm thì bỏ qua dòng đó.`;
 
-        // Fast verified models with independent quota pools & per-call timeout
+        // Fast verified models with per-call timeout
         const MODEL_POOL = [
           "gemini-3.1-flash-lite",
           "gemini-2.5-flash",
-          "gemini-2.0-flash",
+          "gemini-3.1-flash-lite",
         ];
 
         const callGeminiMultiModel = async (): Promise<any> => {
