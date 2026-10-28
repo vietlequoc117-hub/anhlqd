@@ -1,0 +1,6 @@
+{
+  "name": "VietGrade OCR & Excel Sync",
+  "description": "Hệ thống AI OCR nhận diện điểm viết tay trên Phiếu Chấm Bài Thi và tự động khớp SBD, điền điểm vào file Excel bảo toàn định dạng gốc.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
