@@ -45,6 +45,53 @@ interface UploadedImage {
   name: string;
   mimeType: string;
   dataUrl: string;
+  status?: "PENDING" | "PROCESSING" | "DONE" | "ERROR";
+  extractedCount?: number;
+}
+
+/**
+ * Compresses large smartphone photos client-side (max 1600px) so uploading 13–50 images
+ * simultaneously never hits 413 Payload Too Large limits on Cloud Run or Vercel.
+ */
+async function optimizeImageForBatchOcr(
+  file: File
+): Promise<{ dataUrl: string; mimeType: string }> {
+  const rawDataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 1600;
+      if (img.width <= maxDim && img.height <= maxDim && file.size < 900 * 1024) {
+        resolve({ dataUrl: rawDataUrl, mimeType: file.type || "image/png" });
+        return;
+      }
+      const scale = Math.min(maxDim / img.width, maxDim / img.height, 1);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        resolve({ dataUrl: rawDataUrl, mimeType: file.type || "image/png" });
+        return;
+      }
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve({
+        dataUrl: canvas.toDataURL("image/jpeg", 0.88),
+        mimeType: "image/jpeg",
+      });
+    };
+    img.onerror = () =>
+      resolve({ dataUrl: rawDataUrl, mimeType: file.type || "image/png" });
+    img.src = rawDataUrl;
+  });
 }
 
 type OcrEngineMode = "LOCAL_WASM" | "RAPID_KEYBOARD" | "HYBRID_CLOUD";
@@ -408,84 +455,138 @@ if __name__ == "__main__":
     append = false
   ) => {
     if (targetImages.length === 0) return;
+
+    if (engineMode === "RAPID_KEYBOARD") {
+      setOcrNotice(
+        "Đang ở Chế độ Nhập Nhanh Bàn Phím (Không cần API): Gõ điểm (VD: 8,5) và nhấn Enter để xuống dòng tức thì."
+      );
+      return;
+    }
+
     setIsOcrRunning(true);
     setOcrNotice(null);
-    setOcrProgressPct(10);
+    setOcrProgressPct(5);
+
+    if (!append) {
+      setOcrRecords([]);
+    }
+
+    let totalExtractedAcrossBatch = 0;
+    const totalFiles = targetImages.length;
 
     try {
-      // MODE 1: 100% Local Browser WebAssembly OCR (No API required, never 503!)
-      if (engineMode === "LOCAL_WASM") {
-        const localRecords = await runLocalBrowserOcr({
-          images: targetImages,
-          knownSbds: activeKnownSbds,
-          onProgress: (text, pct) => {
-            setOcrProgressText(text);
-            setOcrProgressPct(pct);
-          },
-        });
-        mergeIncomingRecords(localRecords, append);
-        setOcrNotice(
-          `Đã quét thành công ${localRecords.length} dòng điểm bằng OCR Nội Bộ (WebAssembly — Không dùng API).`
+      // Process each image sequentially in a fault-tolerant batch queue (1..13+)
+      // so each sheet streams into the table immediately and never triggers 413/timeout!
+      for (let idx = 0; idx < totalFiles; idx++) {
+        const currentImg = targetImages[idx];
+        const basePct = Math.round((idx / totalFiles) * 100);
+
+        // Mark this image tab as PROCESSING and focus it so the user sees live progress
+        setImages((prev) =>
+          prev.map((item) =>
+            item.id === currentImg.id ? { ...item, status: "PROCESSING" } : item
+          )
         );
-        return;
-      }
-
-      // MODE 2: Rapid Keyboard Mode doesn't need slow OCR, user types directly
-      if (engineMode === "RAPID_KEYBOARD") {
-        setOcrNotice(
-          "Đang ở Chế độ Nhập Nhanh Bàn Phím (Không cần API): Gõ điểm (VD: 8,5) và nhấn Enter để xuống dòng tức thì."
-        );
-        return;
-      }
-
-      // MODE 3: Hybrid Cloud AI -> Auto-Fallback to Local Wasm OCR if 503 or on static Vercel
-      setOcrProgressText("Đang kết nối AI OCR đa luồng (Tự động chuyển sang Local OCR nếu quá tải)...");
-      setOcrProgressPct(35);
-
-      try {
-        const response = await fetch("/api/ocr", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            images: targetImages.map((img) => ({
-              name: img.name,
-              mimeType: img.mimeType,
-              data: img.dataUrl,
-            })),
-          }),
+        setActiveImageIdx((prevIdx) => {
+          const foundIdx = images.findIndex((x) => x.id === currentImg.id);
+          return foundIdx >= 0 ? foundIdx : prevIdx;
         });
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json();
-        if (Array.isArray(data.records) && data.records.length > 0) {
-          mergeIncomingRecords(data.records, append);
-          setOcrNotice(`Đã trích xuất ${data.records.length} dòng điểm.`);
-          return;
-        }
-        throw new Error("Empty cloud response");
-      } catch {
-        // Seamless automatic fallback to 100% Local Browser WebAssembly OCR!
         setOcrProgressText(
-          "Máy chủ AI đám mây đang bận hoặc chạy trên Vercel tĩnh — Tự động chuyển sang OCR Nội Bộ (WebAssembly)..."
+          `Đang xử lý phiếu chấm (${idx + 1}/${totalFiles}): ${currentImg.name}...`
         );
-        const fallbackRecords = await runLocalBrowserOcr({
-          images: targetImages,
-          knownSbds: activeKnownSbds,
-          onProgress: (text, pct) => {
-            setOcrProgressText(text);
-            setOcrProgressPct(pct);
-          },
-        });
-        mergeIncomingRecords(fallbackRecords, append);
-        setOcrNotice(
-          `Đã tự động chuyển sang OCR Nội Bộ (Không cần API) và trích xuất ${fallbackRecords.length} dòng điểm.`
+        setOcrProgressPct(Math.max(8, basePct));
+
+        let sheetRecords: OcrRecord[] = [];
+
+        if (engineMode === "LOCAL_WASM") {
+          sheetRecords = await runLocalBrowserOcr({
+            images: [currentImg],
+            knownSbds: activeKnownSbds,
+            onProgress: (text, subPct) => {
+              const overallPct = Math.min(
+                99,
+                Math.round(((idx + subPct / 100) / totalFiles) * 100)
+              );
+              setOcrProgressText(`[Phiếu ${idx + 1}/${totalFiles}] ${text}`);
+              setOcrProgressPct(overallPct);
+            },
+          });
+        } else {
+          // HYBRID_CLOUD: Call /api/ocr per single compressed image with automatic fallback to Local OCR
+          try {
+            const response = await fetch("/api/ocr", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                images: [
+                  {
+                    name: currentImg.name,
+                    mimeType: currentImg.mimeType,
+                    data: currentImg.dataUrl,
+                  },
+                ],
+              }),
+            });
+
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            const data = await response.json();
+            if (Array.isArray(data.records) && data.records.length > 0) {
+              sheetRecords = data.records;
+            } else {
+              throw new Error("Empty cloud records");
+            }
+          } catch {
+            // Automatic per-image fallback to Local Browser OCR if cloud is busy or offline
+            sheetRecords = await runLocalBrowserOcr({
+              images: [currentImg],
+              knownSbds: activeKnownSbds,
+              onProgress: (text, subPct) => {
+                const overallPct = Math.min(
+                  99,
+                  Math.round(((idx + subPct / 100) / totalFiles) * 100)
+                );
+                setOcrProgressText(
+                  `[Phiếu ${idx + 1}/${totalFiles} · Dự phòng Local] ${text}`
+                );
+                setOcrProgressPct(overallPct);
+              },
+            });
+          }
+        }
+
+        totalExtractedAcrossBatch += sheetRecords.length;
+
+        // Immediately stream this sheet's extracted scores into the live table & Hình 3 preview!
+        if (sheetRecords.length > 0) {
+          mergeIncomingRecords(sheetRecords, true);
+        }
+
+        // Mark this image tab as DONE with extracted count
+        setImages((prev) =>
+          prev.map((item) =>
+            item.id === currentImg.id
+              ? {
+                  ...item,
+                  status: "DONE",
+                  extractedCount: sheetRecords.length,
+                }
+              : item
+          )
         );
+
+        setOcrProgressPct(Math.round(((idx + 1) / totalFiles) * 100));
       }
+
+      setOcrNotice(
+        `Đã quét hoàn tất ${totalFiles} phiếu chấm và trích xuất tổng cộng ${totalExtractedAcrossBatch} dòng điểm.`
+      );
     } catch (err: any) {
       setOcrNotice(
-        err?.message || "Bạn có thể gõ nhanh điểm ở bảng bên phải (Enter để xuống dòng)."
+        err?.message ||
+          "Đã xử lý xong các phiếu khả dụng. Bạn có thể kiểm tra kết quả ở bảng bên phải."
       );
     } finally {
       setIsOcrRunning(false);
@@ -498,20 +599,17 @@ if __name__ == "__main__":
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
+    setOcrNotice(`Đang nén tối ưu & nạp ${files.length} ảnh phiếu chấm...`);
     const newImages: UploadedImage[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
+      const optimized = await optimizeImageForBatchOcr(file);
       newImages.push({
         id: `${file.name}-${Date.now()}-${i}`,
         name: file.name,
-        mimeType: file.type || "image/png",
-        dataUrl,
+        mimeType: optimized.mimeType,
+        dataUrl: optimized.dataUrl,
+        status: "PENDING",
       });
     }
 
@@ -837,7 +935,7 @@ if __name__ == "__main__":
             </div>
             <div>
               <div className="text-xs text-slate-500">
-                Bước 1 · File Excel Nguồn · Xử lý 100% Trực tiếp trên Trình duyệt (Tương thích GitHub &amp; Vercel)
+                Bước 1 · File Excel Nguồn
               </div>
               <div className="text-sm font-bold text-slate-900 font-mono">
                 {excelData ? excelData.fileName : "Chưa tải lên file Excel nguồn"}
@@ -873,33 +971,6 @@ if __name__ == "__main__":
                 <h1 className="text-xl font-bold text-slate-900">
                   01. Tải Lên File Excel Nguồn Cần Nhập Điểm
                 </h1>
-                <p className="text-xs text-slate-600 mt-1">
-                  Toàn bộ quá trình đọc cấu trúc bảng, nhận diện cột <strong>Số BD</strong> (cột{" "}
-                  {sbdCol}) và cột <strong>Điểm</strong> (cột {scoreCol}) chạy trực tiếp ngay trên
-                  trình duyệt của bạn — <strong>không cần máy chủ backend hay API key</strong>, hoạt
-                  động mượt mà trên cả GitHub &amp; Vercel.
-                </p>
-              </div>
-
-              <div className="flex items-center gap-3 shrink-0">
-                <button
-                  type="button"
-                  onClick={handleLoadSampleWorkspace}
-                  disabled={isExcelLoading}
-                  className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isExcelLoading ? "animate-spin" : ""}`} />
-                  <span>Nạp Bộ Mẫu (Hình 1 + Hình 2 → Hình 3)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => excelInputRef.current?.click()}
-                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
-                >
-                  <FileUp className="w-4 h-4" />
-                  <span>Chọn File Excel Từ Máy Tính</span>
-                </button>
               </div>
             </div>
 
@@ -1126,119 +1197,18 @@ if __name__ == "__main__":
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div>
                 <h1 className="text-xl font-bold text-slate-900">
-                  02. Tải Ảnh Phiếu Chấm Bài Thi &amp; Trích Xuất Điểm (Không Cần API)
+                  02. Tải Ảnh Phiếu Chấm Bài Thi &amp; Trích Xuất Điểm
                 </h1>
-                <p className="text-xs text-slate-600 mt-1">
-                  Chọn phương thức tối ưu nhất cho bạn: <strong>OCR Nội Bộ (WebAssembly)</strong> chạy
-                  100% trên trình duyệt không sợ lỗi 503, hoặc{" "}
-                  <strong>Nhập Nhanh Bàn Phím Đối Chiếu Ảnh</strong> (gõ điểm{" "}
-                  <code className="font-mono">8,5</code> + nhấn <code className="font-mono">Enter</code>{" "}
-                  tự động xuống dòng theo đúng danh sách SBD của Bước 1).
-                </p>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep(1)}
-                  className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors flex items-center gap-1 cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Bước 1</span>
-                </button>
-
-                <input
-                  ref={imageInputRef}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={handleImageUpload}
-                  className="hidden"
-                />
-                <button
-                  type="button"
-                  onClick={() => imageInputRef.current?.click()}
-                  className="px-3.5 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>Tải Ảnh Phiếu Chấm</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setShowBulkPaste((v) => !v)}
-                  className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                >
-                  <ClipboardPaste className="w-3.5 h-3.5" />
-                  <span>Dán Nhanh Điểm</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep(3)}
-                  disabled={ocrRecords.length === 0}
-                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                >
-                  <span>Sang Bước 3: Xuất Excel ({stats.matchedCount})</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Engine Selector Bar (Zero-API Modes Highlighted) */}
-            <div className="p-3 bg-white border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-100 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => setEngineMode("LOCAL_WASM")}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                    engineMode === "LOCAL_WASM"
-                      ? "bg-white text-slate-900 shadow-xs"
-                      : "text-slate-600 hover:text-slate-900"
-                  }`}
-                >
-                  <Cpu className="w-3.5 h-3.5 text-emerald-700" />
-                  <span>OCR Nội Bộ (WebAssembly — Không Cần API)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setEngineMode("RAPID_KEYBOARD")}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                    engineMode === "RAPID_KEYBOARD"
-                      ? "bg-white text-slate-900 shadow-xs"
-                      : "text-slate-600 hover:text-slate-900"
-                  }`}
-                >
-                  <Keyboard className="w-3.5 h-3.5 text-blue-700" />
-                  <span>Nhập Nhanh Bàn Phím Theo SBD (1 giây/dòng — Không Cần API)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setEngineMode("HYBRID_CLOUD")}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
-                    engineMode === "HYBRID_CLOUD"
-                      ? "bg-white text-slate-900 shadow-xs"
-                      : "text-slate-600 hover:text-slate-900"
-                  }`}
-                >
-                  <ScanText className="w-3.5 h-3.5 text-slate-700" />
-                  <span>AI Đa Luồng + Tự Động Dự Phòng Local</span>
-                </button>
-              </div>
-
-              {images.length > 0 && engineMode !== "RAPID_KEYBOARD" && (
-                <button
-                  type="button"
-                  onClick={() => executeOcrPipeline(images, knownSbds, false)}
-                  disabled={isOcrRunning}
-                  className="px-3.5 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isOcrRunning ? "animate-spin" : ""}`} />
-                  <span>{isOcrRunning ? "Đang quét..." : "Chạy Quét Ảnh Ngay"}</span>
-                </button>
-              )}
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={handleImageUpload}
+                className="hidden"
+              />
             </div>
 
             {/* Optional Bulk Paste Drawer */}
@@ -1246,7 +1216,7 @@ if __name__ == "__main__":
               <div className="p-4 bg-white border border-slate-300 rounded-lg space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-bold text-slate-900">
-                    Dán Nhanh Danh Sách Điểm (Không Cần API)
+                    Dán Nhanh Danh Sách Điểm
                   </div>
                   <button
                     type="button"
@@ -1256,11 +1226,7 @@ if __name__ == "__main__":
                     Đóng
                   </button>
                 </div>
-                <p className="text-xs text-slate-600">
-                  Dán từng dòng theo cú pháp <code className="font-mono">K6.001 8,5</code> hoặc chỉ
-                  cần dán một cột điểm (<code className="font-mono">8,5</code> xuống dòng{" "}
-                  <code className="font-mono">6,7</code>...) theo đúng thứ tự SBD của file Excel nguồn.
-                </p>
+                
                 <textarea
                   rows={4}
                   value={bulkPasteText}
@@ -1328,19 +1294,33 @@ if __name__ == "__main__":
                 </div>
 
                 {images.length > 1 && (
-                  <div className="px-4 py-2 border-b border-slate-200 flex items-center gap-1.5 overflow-x-auto bg-white">
+                  <div className="px-3 py-2 border-b border-slate-200 flex items-center gap-1.5 overflow-x-auto bg-white">
                     {images.map((img, idx) => (
                       <button
                         key={img.id}
                         type="button"
                         onClick={() => setActiveImageIdx(idx)}
-                        className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
                           idx === activeImageIdx
                             ? "bg-slate-900 text-white"
-                            : "bg-slate-100 text-slate-600 hover:text-slate-900"
+                            : "bg-slate-100 text-slate-700 hover:text-slate-900"
                         }`}
                       >
-                        Phiếu #{idx + 1}: {img.name}
+                        <span>Phiếu #{idx + 1}</span>
+                        {img.status === "PROCESSING" && (
+                          <RefreshCw className="w-3 h-3 animate-spin text-blue-400" />
+                        )}
+                        {img.status === "DONE" && (
+                          <span
+                            className={`text-[10px] font-mono ${
+                              idx === activeImageIdx
+                                ? "text-emerald-300"
+                                : "text-emerald-700"
+                            }`}
+                          >
+                            ✓{img.extractedCount ?? 0}
+                          </span>
+                        )}
                       </button>
                     ))}
                   </div>
@@ -1364,10 +1344,7 @@ if __name__ == "__main__":
                       <div className="text-sm font-semibold text-slate-700">
                         Tải ảnh chụp "PHIẾU CHẤM BÀI THI"
                       </div>
-                      <p className="text-xs text-slate-500 max-w-xs mx-auto">
-                        Tải ảnh lên để quét bằng OCR Nội Bộ (WebAssembly) hoặc vừa nhìn ảnh vừa gõ
-                        điểm siêu tốc bên phải.
-                      </p>
+                      
                       <button
                         type="button"
                         onClick={() => imageInputRef.current?.click()}
@@ -1509,21 +1486,26 @@ if __name__ == "__main__":
                     </div>
 
                     <div className="flex-1 overflow-auto max-h-[540px]">
-                      {isOcrRunning ? (
-                        <div className="p-8 space-y-3">
-                          <div className="flex items-center justify-between text-xs font-medium text-blue-700">
+                      {isOcrRunning && (
+                        <div className="p-4 bg-blue-50/70 border-b border-blue-200 space-y-2 sticky top-0 z-20">
+                          <div className="flex items-center justify-between text-xs font-semibold text-blue-900">
                             <div className="flex items-center gap-2">
-                              <RefreshCw className="w-4 h-4 animate-spin" />
-                              <span>{ocrProgressText || "Đang xử lý ảnh phiếu chấm..."}</span>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-700 shrink-0" />
+                              <span>{ocrProgressText || "Đang xử lý hàng loạt ảnh phiếu chấm..."}</span>
                             </div>
                             <span className="font-mono tabular-nums">{ocrProgressPct}%</span>
                           </div>
-                          <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                          <div className="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden">
                             <div
                               className="h-full bg-blue-600 transition-all duration-200"
                               style={{ width: `${ocrProgressPct}%` }}
                             />
                           </div>
+                        </div>
+                      )}
+
+                      {isOcrRunning && ocrRecords.length === 0 ? (
+                        <div className="p-6 space-y-2.5">
                           {[1, 2, 3, 4, 5].map((n) => (
                             <div
                               key={n}
@@ -1538,7 +1520,7 @@ if __name__ == "__main__":
                           </div>
                           <p className="text-xs text-slate-500 max-w-sm mx-auto">
                             Tải ảnh Phiếu Chấm Bài Thi để quét bằng{" "}
-                            <strong>OCR Nội Bộ (WebAssembly — Không cần API)</strong> hoặc bấm nút
+                            <strong>OCR Nội Bộ</strong> hoặc bấm nút
                             bên dưới để gõ điểm trực tiếp theo danh sách SBD.
                           </p>
                           <div className="flex items-center justify-center gap-3 pt-1">
@@ -1650,43 +1632,13 @@ if __name__ == "__main__":
             {/* Live Matched Excel Preview (Hình 3: Kết Quả So Khớp SBD Hình 1 × Hình 2) */}
             {excelData && ocrRecords.length > 0 && (
               <div className="bg-white border-2 border-emerald-600/80 rounded-lg overflow-hidden shadow-xs">
-                <div className="px-4 py-3 bg-emerald-50/80 border-b border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
-                      <span>
-                        KẾT QUẢ SO KHỚP CỘT SBD (HÌNH 1 × HÌNH 2 → HÌNH 3): Đã khớp{" "}
-                        {stats.matchedCount}/{stats.totalExcelStudents} học sinh
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-emerald-800 mt-0.5">
-                      Đối chiếu cột <strong>SBD</strong> trên Phiếu Chấm (Hình 1) với cột{" "}
-                      <strong>Số BD (Cột {sbdCol})</strong> trên File Excel (Hình 2) và điền điểm số
-                      thập phân vào cột <strong>Điểm (Cột {scoreCol})</strong> đúng chuẩn Hình 3.
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-2.5 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setCurrentStep(3)}
-                      className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer"
-                    >
-                      Xem Mã Python Openpyxl
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleExecuteAndExport}
-                      disabled={isExporting}
-                      className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>
-                        {isExporting
-                          ? "Đang xuất file..."
-                          : "Tải File Excel Hoàn Chỉnh Như Hình 3 (.xlsx)"}
-                      </span>
-                    </button>
+                <div className="px-4 py-3 bg-emerald-50/80 border-b border-emerald-200 flex items-center justify-between">
+                  <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                    <span>
+                      KẾT QUẢ SO KHỚP CỘT SBD: Đã khớp{" "}
+                      {stats.matchedCount}/{stats.totalExcelStudents} học sinh
+                    </span>
                   </div>
                 </div>
 
@@ -1809,31 +1761,8 @@ if __name__ == "__main__":
                   <strong className="text-emerald-700 font-mono tabular-nums">
                     {stats.matchedCount}
                   </strong>{" "}
-                  học sinh. Chỉ ghi đè giá trị Float vào cột{" "}
-                  <strong>Điểm (Cột {scoreCol})</strong>, giữ nguyên 100% các vùng gộp ô, tiêu đề và
-                  viền kẻ bảng của file nguồn.
+                  học sinh.
                 </p>
-              </div>
-
-              <div className="flex items-center gap-3 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep(2)}
-                  className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors flex items-center gap-1 cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Quay lại Bước 2</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleExecuteAndExport}
-                  disabled={isExporting || !excelData || ocrRecords.length === 0}
-                  className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>{isExporting ? "Đang xử lý..." : "Tải File Excel Đã Điền Điểm"}</span>
-                </button>
               </div>
             </div>
 
@@ -2032,106 +1961,68 @@ if __name__ == "__main__":
               </div>
             </div>
 
-            {/* Python Code & Client-Side Export Card */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-              <div className="lg:col-span-7 bg-[#0F172A] text-slate-100 rounded-lg border border-slate-800 flex flex-col overflow-hidden">
-                <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between bg-slate-900/80">
-                  <div className="flex items-center gap-2 text-xs text-slate-300 font-mono">
-                    <Code2 className="w-3.5 h-3.5 text-blue-400" />
-                    <span>auto_update_scores_openpyxl.py</span>
-                  </div>
+            {/* Excel Export Card */}
+            <div className="max-w-2xl mx-auto w-full bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-base font-bold text-slate-900">
+                    Xuất File Excel Đã Nhập Điểm Hoàn Chỉnh
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Đã điền điểm số thực Float vào cột {scoreCol}, bảo toàn 100% định dạng file nguồn.
+                  </p>
+                </div>
+                <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
+                  <FileCheck2 className="w-5 h-5" />
+                </div>
+              </div>
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleCopyCode}
-                      className="px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded transition-colors flex items-center gap-1.5 cursor-pointer"
-                    >
-                      {copiedCode ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                      <span>{copiedCode ? "Đã chép" : "Sao chép"}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDownloadPythonScript}
-                      className="px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded transition-colors cursor-pointer"
-                    >
-                      Tải file .py
-                    </button>
+              <div className="grid grid-cols-3 gap-3 text-xs border-t border-b border-slate-200 py-3.5 bg-slate-50/60 rounded-lg px-3">
+                <div className="text-center">
+                  <div className="text-slate-500 text-[11px]">Tiêu đề Sở/Trường</div>
+                  <div className="font-mono text-emerald-700 font-bold mt-0.5">
+                    Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
                   </div>
                 </div>
+                <div className="text-center border-x border-slate-200">
+                  <div className="text-slate-500 text-[11px]">Font chữ &amp; Viền kẻ</div>
+                  <div className="font-mono text-slate-900 font-bold mt-0.5">Giữ nguyên 100%</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-slate-500 text-[11px]">Kiểu dữ liệu điểm</div>
+                  <div className="font-mono text-blue-700 font-bold mt-0.5">Số thực (Float)</div>
+                </div>
+              </div>
 
-                <pre className="p-4 text-xs font-mono leading-relaxed overflow-x-auto flex-1 max-h-[360px] text-slate-200">
-                  <code>{liveOpenpyxlScript}</code>
+              {exportResult && (
+                <pre className="p-3 bg-slate-900 text-emerald-300 font-mono text-[11px] rounded-lg border border-slate-800 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                  {exportResult.pythonAuditLog}
                 </pre>
-              </div>
+              )}
 
-              <div className="lg:col-span-5 bg-white border border-slate-200 rounded-lg p-5 flex flex-col justify-between space-y-4">
-                <div className="space-y-3">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <h2 className="text-sm font-bold text-slate-900">
-                        Xuất File Excel Trực Tiếp (Không Cần Server/API)
-                      </h2>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        Chỉ ghi đè giá trị Float vào cột {scoreCol}, bảo toàn 100% định dạng.
-                      </p>
-                    </div>
-                    <FileCheck2 className="w-5 h-5 text-blue-700 shrink-0" />
-                  </div>
-
-                  <div className="space-y-2 text-xs border-t border-b border-slate-200 py-3">
-                    <div className="flex justify-between">
-                      <span className="text-slate-600">Tiêu đề Sở/Trường:</span>
-                      <span className="font-mono text-emerald-700 font-medium">
-                        Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-600">Font chữ &amp; Khung viền:</span>
-                      <span className="font-mono text-slate-900">Giữ nguyên 100%</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-600">Kiểu dữ liệu điểm:</span>
-                      <span className="font-mono font-bold text-blue-700">Float/Number</span>
-                    </div>
-                  </div>
-
-                  {exportResult && (
-                    <pre className="p-3 bg-slate-900 text-emerald-300 font-mono text-[11px] rounded border border-slate-800 overflow-x-auto whitespace-pre-wrap leading-relaxed">
-                      {exportResult.pythonAuditLog}
-                    </pre>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleExecuteAndExport}
-                  disabled={isExporting || !excelData || ocrRecords.length === 0}
-                  className="w-full px-4 py-2.5 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>
-                    {exportResult
-                      ? `Tải Lại ${exportResult.outputFileName}`
-                      : "Xuất & Tải File Excel Đã Nhập Điểm"}
-                  </span>
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={handleExecuteAndExport}
+                disabled={isExporting || !excelData || ocrRecords.length === 0}
+                className="w-full py-3 px-4 text-sm font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-xs cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>
+                  {isExporting
+                    ? "Đang xuất file Excel..."
+                    : exportResult
+                    ? `Tải Lại ${exportResult.outputFileName}`
+                    : "Tải File Excel Đã Nhập Điểm (.xlsx)"}
+                </span>
+              </button>
             </div>
           </section>
         )}
       </main>
 
       <footer className="mt-12 border-t border-slate-200 bg-white py-4 px-6">
-        <div className="max-w-[1400px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>
-            Hoạt động độc lập 100% trên trình duyệt (GitHub &amp; Vercel Ready) · Không phụ thuộc API
-          </span>
-          <span>Bảo toàn 100% định dạng Excel · Số thực Float/Number</span>
+        <div className="max-w-[1400px] mx-auto flex items-center justify-center text-xs font-semibold text-slate-700 tracking-wide">
+          <span>VIETLEQUOC117@GMAIL.COM : 0837110784</span>
         </div>
       </footer>
     </div>
