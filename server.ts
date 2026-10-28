@@ -513,90 +513,94 @@ async function startServer() {
       for (const img of images) {
         const cleanBase64 = img.data.includes(",") ? img.data.split(",")[1] : img.data;
 
-        const systemInstruction = `Bạn là Chuyên gia Thị giác máy tính & OCR chữ viết tay Tiếng Việt cấp cao, chuyên đọc "PHIẾU CHẤM BÀI THI" và bảng điểm viết tay của giáo viên Việt Nam.
+        const systemInstruction = `Bạn là Chuyên gia Thị giác máy tính & OCR chữ viết tay Tiếng Việt cấp cao, chuyên đọc "PHIẾU CHẤM BÀI THI" của giáo viên Việt Nam.
 
 NHIỆM VỤ BẮT BUỘC:
 1. Quét từng dòng của bảng điểm trong ảnh chụp "PHIẾU CHẤM BÀI THI".
-2. Trích xuất chính xác 2 trường cốt lõi trên mỗi dòng có dữ liệu học sinh:
-   - "sbd": Mã Số Báo Danh đã chuẩn hóa (ví dụ: "K6.001", "K6.002", loại bỏ hoàn toàn khoảng trắng thừa).
-   - "rawScoreText": Chuỗi chữ số viết tay nguyên bản ở cột "ĐIỂM BẰNG SỐ" (ví dụ: "8,5", "6,7", "7,4", "9", "10").
-   - "score": Giá trị số thực (Float/Number) sau khi đã đổi dấu phẩy thập phân (",") sang dấu chấm ("."). Ví dụ: "8,5" -> 8.5; "6,7" -> 6.7; "7,4" -> 7.4; "8" -> 8.
-   - "scoreInWords": Nội dung cột "ĐIỂM BẰNG CHỮ" (nếu có trên ảnh) để đối chiếu chéo.
-3. NGUYÊN TẮC NHẬN DIỆN CHỮ SỐ VIẾT TAY GIÁO VIÊN VIỆT NAM:
-   - Phân biệt rõ số 1 và số 7: Giáo viên Việt Nam viết số 7 thường có nét gạch ngang ở giữa thân (┼), trong khi số 1 là nét sổ thẳng hoặc có nét hất ngắn ở đỉnh, KHÔNG có gạch ngang giữa thân. Luôn đối chiếu với cột "Điểm bằng chữ" (nếu có) để xác thực tuyệt đối.
-   - Phân biệt số 4 viết tay dạng hở đỉnh và dạng kín đỉnh.
-   - Phân biệt số 6 (vòng bụng dưới, nét uốn từ trên xuống) và số 0 (khép kín hoàn toàn).
-   - Phân biệt số 5 (nét ngang phẳng trên đỉnh) và số 6.
-   - Chỉ trích xuất các dòng thực sự có ghi SBD và Điểm, bỏ qua các dòng trống.`;
+2. Trích xuất chính xác các dòng CÓ GHI ĐIỂM ở cột "ĐIỂM BẰNG SỐ":
+   - "sbd": Mã Số Báo Danh ở cột SBD, đã chuẩn hóa và loại bỏ khoảng trắng thừa (ví dụ: "K6.001", "K6.002", "K6.003", "K6.004", "K6.005").
+   - "rawScoreText": Chuỗi chữ số viết tay nguyên bản ở cột "ĐIỂM BẰNG SỐ" (ví dụ: "8,5", "6,7", "7,4", "6,2", "3,8").
+   - "score": Giá trị số thực (Float/Number) sau khi đã đổi dấu phẩy thập phân (",") sang dấu chấm ("."). Ví dụ: "8,5" -> 8.5; "6,7" -> 6.7; "7,4" -> 7.4; "6,2" -> 6.2; "3,8" -> 3.8.
+3. NGUYÊN TẮC BẮT BUỘC:
+   - Phân biệt rõ số 1 và số 7 (số 7 viết tay của giáo viên Việt Nam thường có nét gạch ngang ở giữa thân ┼).
+   - Phân biệt rõ số 4 viết tay dạng hở đỉnh (giống 7, 4) và dạng kín đỉnh.
+   - Phân biệt rõ số 6, số 2, số 3, số 8, số 5, số 0.
+   - NẾU DÒNG NÀO CÓ SBD NHƯNG Ô "ĐIỂM BẰNG SỐ" ĐỂ TRỐNG (chưa chấm điểm, ví dụ K6.006, K6.007 để trống): TUYỆT ĐỐI BỎ QUA, KHÔNG đưa vào danh sách kết quả.`;
 
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: img.mimeType || "image/png",
-                  data: cleanBase64,
-                },
-              },
-              {
-                text: `Hãy đọc toàn bộ bảng điểm viết tay trong ảnh "${img.name}" và trả về danh sách JSON các dòng SBD và Điểm bằng số đã chuẩn hóa.`,
-              },
-            ],
-          },
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                sheetTitle: {
-                  type: Type.STRING,
-                  description: "Tiêu đề phiếu chấm bài thi nhận diện được từ ảnh",
-                },
-                rows: {
-                  type: Type.ARRAY,
-                  items: {
+        const MODEL_POOL = [
+          "gemini-3.1-flash-lite",
+          "gemini-flash-latest",
+          "gemini-3.8-flash",
+        ];
+
+        const callGeminiMultiModel = async (): Promise<any> => {
+          let lastError: any = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            for (const modelName of MODEL_POOL) {
+              try {
+                const configObj: Record<string, any> = {
+                  systemInstruction,
+                  temperature: 0.1,
+                  responseMimeType: "application/json",
+                  responseSchema: {
                     type: Type.OBJECT,
                     properties: {
-                      rawSbd: {
-                        type: Type.STRING,
-                        description: "SBD gốc đọc được trên phiếu",
-                      },
-                      sbd: {
-                        type: Type.STRING,
-                        description: "SBD đã chuẩn hóa, loại bỏ khoảng trắng (VD: K6.001)",
-                      },
-                      rawScoreText: {
-                        type: Type.STRING,
-                        description: "Điểm bằng số nguyên bản trên phiếu (VD: 8,5)",
-                      },
-                      score: {
-                        type: Type.NUMBER,
-                        description: "Điểm dạng số thập phân chuẩn dùng dấu chấm (VD: 8.5)",
-                      },
-                      scoreInWords: {
-                        type: Type.STRING,
-                        description: "Điểm bằng chữ ghi bên cạnh (nếu có)",
-                      },
-                      confidence: {
-                        type: Type.STRING,
-                        description: "Mức độ tự tin: CAO, TRUNG_BINH, hoặc CAN_KIEM_TRA",
-                      },
-                      notes: {
-                        type: Type.STRING,
-                        description: "Ghi chú nhận diện nét chữ (VD: Số 7 có gạch ngang, khớp điểm chữ)",
+                      sheetTitle: { type: Type.STRING },
+                      rows: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            rawSbd: { type: Type.STRING },
+                            sbd: { type: Type.STRING },
+                            rawScoreText: { type: Type.STRING },
+                            score: { type: Type.NUMBER },
+                            scoreInWords: { type: Type.STRING },
+                            confidence: { type: Type.STRING },
+                            notes: { type: Type.STRING },
+                          },
+                          required: ["sbd", "rawScoreText", "score"],
+                        },
                       },
                     },
-                    required: ["sbd", "rawScoreText", "score", "confidence"],
+                    required: ["rows"],
                   },
-                },
-              },
-              required: ["rows"],
-            },
-          },
-        });
+                };
+
+                if (modelName === "gemini-3.8-flash") {
+                  configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+                }
+
+                return await ai.models.generateContent({
+                  model: modelName,
+                  contents: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: img.mimeType || "image/png",
+                          data: cleanBase64,
+                        },
+                      },
+                      {
+                        text: `Đọc bảng điểm viết tay trong ảnh "${img.name}". Trích xuất chính xác từng cặp (SBD, ĐIỂM BẰNG SỐ). Bỏ qua các dòng mà cột ĐIỂM BẰNG SỐ bị bỏ trống.`,
+                      },
+                    ],
+                  },
+                  config: configObj,
+                });
+              } catch (err: any) {
+                lastError = err;
+                console.warn(
+                  `[OCR Fallback] Model ${modelName} gặp lỗi ${err?.status || "unknown"}, chuyển ngay sang model tiếp theo...`
+                );
+              }
+            }
+            await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+          }
+          throw lastError;
+        };
+
+        const response = await callGeminiMultiModel();
 
         const parsed = JSON.parse(response.text || '{"rows": []}');
         if (Array.isArray(parsed.rows)) {

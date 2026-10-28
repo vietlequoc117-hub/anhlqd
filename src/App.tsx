@@ -19,7 +19,9 @@ import {
   FileUp,
   ArrowRight,
   ArrowLeft,
-  Sparkles,
+  Cpu,
+  Keyboard,
+  ClipboardPaste,
 } from "lucide-react";
 import {
   OcrRecord,
@@ -28,6 +30,15 @@ import {
   parseVietnameseScoreClient,
   generateSampleGradingSheetImage,
 } from "./utils/sampleGradingSheet";
+import {
+  parseExcelClientSide,
+  exportUpdatedExcelClientSide,
+  generateSampleExcelClientSide,
+} from "./utils/clientExcelEngine";
+import {
+  runLocalBrowserOcr,
+  parseBulkPastedScores,
+} from "./utils/localOcrEngine";
 
 interface UploadedImage {
   id: string;
@@ -36,11 +47,13 @@ interface UploadedImage {
   dataUrl: string;
 }
 
+type OcrEngineMode = "LOCAL_WASM" | "RAPID_KEYBOARD" | "HYBRID_CLOUD";
+
 export default function App() {
-  // Step Navigation State (Step 1 -> Step 2 -> Step 3)
+  // Sequential Step Navigation (1: Excel Nguồn -> 2: Ảnh Phiếu Chấm -> 3: Khớp & Xuất Excel)
   const [currentStep, setCurrentStep] = useState<1 | 2 | 3>(1);
 
-  // STEP 1: Excel Source File State
+  // STEP 1: Excel Source File State (100% Client-Side Capable)
   const [excelData, setExcelData] = useState<ExcelSheetData | null>(null);
   const [selectedSheetIndex, setSelectedSheetIndex] = useState<number>(0);
   const [headerRow, setHeaderRow] = useState<number>(5);
@@ -50,13 +63,23 @@ export default function App() {
   const [excelError, setExcelError] = useState<string | null>(null);
   const [isExcelDragging, setIsExcelDragging] = useState<boolean>(false);
 
-  // STEP 2: Grading Sheet Images & OCR State
+  // STEP 2: Grading Sheet Images & Zero-API / Hybrid OCR State
+  const [engineMode, setEngineMode] = useState<OcrEngineMode>("HYBRID_CLOUD");
   const [images, setImages] = useState<UploadedImage[]>([]);
   const [activeImageIdx, setActiveImageIdx] = useState<number>(0);
   const [imageZoom, setImageZoom] = useState<number>(1);
   const [isOcrRunning, setIsOcrRunning] = useState<boolean>(false);
-  const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrProgressText, setOcrProgressText] = useState<string>("");
+  const [ocrProgressPct, setOcrProgressPct] = useState<number>(0);
+  const [ocrNotice, setOcrNotice] = useState<string | null>(null);
   const [ocrRecords, setOcrRecords] = useState<OcrRecord[]>([]);
+
+  // Rapid Keyboard Entry & Bulk Paste State (Zero-API Mode)
+  const [rapidInputs, setRapidInputs] = useState<Record<string, string>>({});
+  const [activeRapidRowIdx, setActiveRapidRowIdx] = useState<number>(0);
+  const [showBulkPaste, setShowBulkPaste] = useState<boolean>(false);
+  const [bulkPasteText, setBulkPasteText] = useState<string>("");
+  const rapidInputRefs = useRef<Record<number, HTMLInputElement | null>>({});
 
   // STEP 3: Table Filtering & Export State
   const [rowFilter, setRowFilter] = useState<"ALL" | "MATCHED" | "UNMATCHED">("ALL");
@@ -74,6 +97,14 @@ export default function App() {
 
   const excelInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+
+  // Extract list of known SBDs from Step 1 Excel file to anchor Local OCR
+  const knownSbds = useMemo(() => {
+    if (!excelData) return [];
+    return excelData.studentRows
+      .map((r) => normalizeSbdClient(r.cells[sbdCol] ?? r.sbd))
+      .filter(Boolean);
+  }, [excelData, sbdCol]);
 
   // Lookup map for fast VLOOKUP matching
   const ocrLookupMap = useMemo(() => {
@@ -154,7 +185,7 @@ def normalize_sbd(value) -> str:
     return re.sub(r"\\s+", "", str(value).strip()).replace(",", ".").upper()
 
 def sync_scores_to_excel(excel_path: str, output_path: str):
-    # BƯỚC 1: Đã có file Excel nguồn "${fileName}"
+    # BƯỚC 1: Mở file Excel nguồn "${fileName}", bảo toàn 100% định dạng gốc
     wb = openpyxl.load_workbook(excel_path, data_only=False)
     sheet_names = wb.sheetnames
     ws = wb[sheet_names[${selectedSheetIndex}]] if len(sheet_names) > ${selectedSheetIndex} else wb.active
@@ -164,9 +195,9 @@ def sync_scores_to_excel(excel_path: str, output_path: str):
     SBD_COL = "${sbdCol}"
     SCORE_COL = "${scoreCol}"
 
-    # BƯỚC 2: Dữ liệu (SBD -> Điểm số Float) đã trích xuất OCR từ ảnh PHIẾU CHẤM BÀI THI
+    # BƯỚC 2: Dữ liệu (SBD -> Điểm số Float) đã trích xuất từ PHIẾU CHẤM BÀI THI
     ocr_scores: dict[str, float] = {
-${dictLines || "    # Dữ liệu từ các ảnh phiếu chấm tải lên"}
+${dictLines || "    # Dữ liệu điểm từ Phiếu Chấm Bài Thi"}
     }
 
     updated_count = 0
@@ -188,7 +219,9 @@ if __name__ == "__main__":
     sync_scores_to_excel("${fileName}", "Da_Nhap_Diem_${fileName}")`;
   }, [exportResult, excelData, selectedSheetIndex, headerRow, sbdCol, scoreCol, ocrRecords]);
 
-  // Parse Excel file buffer
+  // ============================================================================
+  // STEP 1 HANDLERS: 100% Client-Side Excel Parsing (Works on Vercel & Offline)
+  // ============================================================================
   const parseAndLoadExcelBuffer = async (
     file: File | Blob,
     fileName: string,
@@ -205,35 +238,26 @@ if __name__ == "__main__":
         reader.readAsDataURL(file);
       });
 
-      const response = await fetch("/api/excel/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64: base64,
-          fileName,
-          sheetIndex,
-        }),
-      });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Lỗi khi phân tích cấu trúc file Excel.");
-      }
-
-      setExcelData({
-        ...data,
+      const parsed = await parseExcelClientSide({
         fileBase64: base64,
+        fileName,
+        targetSheetIndex: sheetIndex,
       });
+
+      setExcelData(parsed);
       setSelectedSheetIndex(sheetIndex);
-      setHeaderRow(data.detectedHeaderRow || 5);
-      setSbdCol(data.detectedSbdCol || "G");
-      setScoreCol(data.detectedScoreCol || "I");
+      setHeaderRow(parsed.detectedHeaderRow || 5);
+      setSbdCol(parsed.detectedSbdCol || "G");
+      setScoreCol(parsed.detectedScoreCol || "I");
       setExportResult(null);
 
-      // Automatically guide user forward to Step 2
+      // Move to Step 2 automatically after loading Source Excel file
       setCurrentStep(2);
     } catch (err: any) {
-      setExcelError(err?.message || "Không thể đọc file Excel. Vui lòng đảm bảo file định dạng .xlsx hợp lệ.");
+      setExcelError(
+        err?.message ||
+          "Không thể đọc file Excel. Vui lòng đảm bảo file có định dạng .xlsx chuẩn."
+      );
     } finally {
       setIsExcelLoading(false);
       if (excelInputRef.current) excelInputRef.current.value = "";
@@ -252,7 +276,7 @@ if __name__ == "__main__":
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
     if (!file.name.endsWith(".xlsx") && !file.name.endsWith(".xls")) {
-      setExcelError("Vui lòng tải lên file Excel có định dạng .xlsx hoặc .xls.");
+      setExcelError("Vui lòng tải lên file Excel có định dạng .xlsx.");
       return;
     }
     await parseAndLoadExcelBuffer(file, file.name, 0);
@@ -263,27 +287,17 @@ if __name__ == "__main__":
     setSelectedSheetIndex(newSheetIdx);
     setIsExcelLoading(true);
     try {
-      const response = await fetch("/api/excel/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64: excelData.fileBase64,
-          fileName: excelData.fileName,
-          sheetIndex: newSheetIdx,
-        }),
+      const parsed = await parseExcelClientSide({
+        fileBase64: excelData.fileBase64,
+        fileName: excelData.fileName,
+        targetSheetIndex: newSheetIdx,
       });
-      const data = await response.json();
-      if (response.ok) {
-        setExcelData({
-          ...data,
-          fileBase64: excelData.fileBase64,
-        });
-        setHeaderRow(data.detectedHeaderRow || 5);
-        setSbdCol(data.detectedSbdCol || "G");
-        setScoreCol(data.detectedScoreCol || "I");
-      }
-    } catch {
-      // Keep existing sheet
+      setExcelData(parsed);
+      setHeaderRow(parsed.detectedHeaderRow || 5);
+      setSbdCol(parsed.detectedSbdCol || "G");
+      setScoreCol(parsed.detectedScoreCol || "I");
+    } catch (err: any) {
+      setExcelError(err?.message || "Không thể chuyển trang tính.");
     } finally {
       setIsExcelLoading(false);
     }
@@ -293,60 +307,70 @@ if __name__ == "__main__":
     setHeaderRow(newHeaderRow);
     if (!excelData) return;
     try {
-      const response = await fetch("/api/excel/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64: excelData.fileBase64,
-          fileName: excelData.fileName,
-          headerRow: newHeaderRow,
-          sbdCol,
-          scoreCol,
-          sheetIndex: selectedSheetIndex,
-        }),
+      const parsed = await parseExcelClientSide({
+        fileBase64: excelData.fileBase64,
+        fileName: excelData.fileName,
+        preferredHeaderRow: newHeaderRow,
+        preferredSbdCol: sbdCol,
+        preferredScoreCol: scoreCol,
+        targetSheetIndex: selectedSheetIndex,
       });
-      const data = await response.json();
-      if (response.ok) {
-        setExcelData({
-          ...data,
-          fileBase64: excelData.fileBase64,
-        });
-      }
+      setExcelData(parsed);
     } catch {
-      // Keep existing
+      // Keep current state
     }
   };
 
-  // Helper to load sample files on demand (not on page load)
+  // Load Sample Bundle (Hình 2 Excel + Hình 1 Grading Sheet -> Matched Hình 3)
   const handleLoadSampleWorkspace = async () => {
     setIsExcelLoading(true);
-    setOcrError(null);
+    setOcrNotice(null);
     setExcelError(null);
 
     try {
-      const excelRes = await fetch("/api/sample-excel");
-      const excelJson = await excelRes.json();
-      if (!excelRes.ok) {
-        throw new Error(excelJson.error || "Không thể tải file Excel mẫu.");
-      }
-      setExcelData(excelJson);
+      // 1. Load Hình 2: Trường THCS Mỹ Xá - Bảng Điểm Thi Môn: Văn 6 (K6.001..K6.005)
+      const sampleExcel = await generateSampleExcelClientSide();
+      setExcelData(sampleExcel);
       setSelectedSheetIndex(0);
-      setHeaderRow(excelJson.detectedHeaderRow || 5);
-      setSbdCol(excelJson.detectedSbdCol || "G");
-      setScoreCol(excelJson.detectedScoreCol || "I");
+      setHeaderRow(sampleExcel.detectedHeaderRow || 5);
+      setSbdCol(sampleExcel.detectedSbdCol || "G");
+      setScoreCol(sampleExcel.detectedScoreCol || "I");
 
-      const sampleImg = generateSampleGradingSheetImage();
+      // 2. Load Hình 1: Actual uploaded grading sheet photo (/assets/aistudio/image_74b23c14.png)
+      let dataUrl = "";
+      try {
+        const resp = await fetch("/assets/aistudio/image_74b23c14.png");
+        if (resp.ok) {
+          const blob = await resp.blob();
+          dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+          });
+        }
+      } catch {
+        // Fallback to generated canvas if static asset is unavailable
+      }
+      if (!dataUrl) {
+        dataUrl = generateSampleGradingSheetImage().dataUrl;
+      }
+
       const sampleImageObj: UploadedImage = {
-        id: `sample-${Date.now()}`,
-        name: sampleImg.name,
-        mimeType: sampleImg.mimeType,
-        dataUrl: sampleImg.dataUrl,
+        id: `hinh1-${Date.now()}`,
+        name: "Hinh_1_Phieu_Cham_Van6.png",
+        mimeType: "image/png",
+        dataUrl,
       };
       setImages([sampleImageObj]);
       setActiveImageIdx(0);
 
-      await runGeminiOcrOnImages([sampleImageObj], false);
+      const sbdsFromSample = sampleExcel.studentRows
+        .map((r) => normalizeSbdClient(r.cells["G"] ?? r.sbd))
+        .filter(Boolean);
+
       setCurrentStep(2);
+      await executeOcrPipeline([sampleImageObj], sbdsFromSample, false);
     } catch (err: any) {
       setExcelError(err?.message || "Lỗi khi khởi tạo dữ liệu mẫu.");
     } finally {
@@ -354,51 +378,125 @@ if __name__ == "__main__":
     }
   };
 
-  // Step 2 OCR execution
-  const runGeminiOcrOnImages = async (targetImages: UploadedImage[], append = false) => {
+  // ============================================================================
+  // STEP 2 HANDLERS: Local WebAssembly OCR / Rapid Keyboard / Cloud Fallback
+  // ============================================================================
+  const mergeIncomingRecords = (incoming: OcrRecord[], append: boolean) => {
+    setOcrRecords((prev) => {
+      const combined = append ? [...prev, ...incoming] : incoming;
+      const bySbd = new Map<string, OcrRecord>();
+      for (const item of combined) {
+        const key = normalizeSbdClient(item.sbd);
+        if (key) bySbd.set(key, item);
+      }
+      const nextList = Array.from(bySbd.values());
+
+      // Sync rapid keyboard inputs map as well
+      const nextRapid: Record<string, string> = {};
+      for (const r of nextList) {
+        nextRapid[normalizeSbdClient(r.sbd)] = r.rawScoreText;
+      }
+      setRapidInputs((prevRapid) => ({ ...prevRapid, ...nextRapid }));
+      return nextList;
+    });
+    setExportResult(null);
+  };
+
+  const executeOcrPipeline = async (
+    targetImages: UploadedImage[],
+    activeKnownSbds: string[],
+    append = false
+  ) => {
     if (targetImages.length === 0) return;
     setIsOcrRunning(true);
-    setOcrError(null);
+    setOcrNotice(null);
+    setOcrProgressPct(10);
 
     try {
-      const response = await fetch("/api/ocr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          images: targetImages.map((img) => ({
-            name: img.name,
-            mimeType: img.mimeType,
-            data: img.dataUrl,
-          })),
-        }),
-      });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Không thể trích xuất dữ liệu từ ảnh.");
+      // MODE 1: 100% Local Browser WebAssembly OCR (No API required, never 503!)
+      if (engineMode === "LOCAL_WASM") {
+        const localRecords = await runLocalBrowserOcr({
+          images: targetImages,
+          knownSbds: activeKnownSbds,
+          onProgress: (text, pct) => {
+            setOcrProgressText(text);
+            setOcrProgressPct(pct);
+          },
+        });
+        mergeIncomingRecords(localRecords, append);
+        setOcrNotice(
+          `Đã quét thành công ${localRecords.length} dòng điểm bằng OCR Nội Bộ (WebAssembly — Không dùng API).`
+        );
+        return;
       }
 
-      const incoming: OcrRecord[] = data.records || [];
-      setOcrRecords((prev) => {
-        const combined = append ? [...prev, ...incoming] : incoming;
-        const bySbd = new Map<string, OcrRecord>();
-        for (const item of combined) {
-          bySbd.set(normalizeSbdClient(item.sbd), item);
+      // MODE 2: Rapid Keyboard Mode doesn't need slow OCR, user types directly
+      if (engineMode === "RAPID_KEYBOARD") {
+        setOcrNotice(
+          "Đang ở Chế độ Nhập Nhanh Bàn Phím (Không cần API): Gõ điểm (VD: 8,5) và nhấn Enter để xuống dòng tức thì."
+        );
+        return;
+      }
+
+      // MODE 3: Hybrid Cloud AI -> Auto-Fallback to Local Wasm OCR if 503 or on static Vercel
+      setOcrProgressText("Đang kết nối AI OCR đa luồng (Tự động chuyển sang Local OCR nếu quá tải)...");
+      setOcrProgressPct(35);
+
+      try {
+        const response = await fetch("/api/ocr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            images: targetImages.map((img) => ({
+              name: img.name,
+              mimeType: img.mimeType,
+              data: img.dataUrl,
+            })),
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-        return Array.from(bySbd.values());
-      });
-      setExportResult(null);
+        const data = await response.json();
+        if (Array.isArray(data.records) && data.records.length > 0) {
+          mergeIncomingRecords(data.records, append);
+          setOcrNotice(`Đã trích xuất ${data.records.length} dòng điểm.`);
+          return;
+        }
+        throw new Error("Empty cloud response");
+      } catch {
+        // Seamless automatic fallback to 100% Local Browser WebAssembly OCR!
+        setOcrProgressText(
+          "Máy chủ AI đám mây đang bận hoặc chạy trên Vercel tĩnh — Tự động chuyển sang OCR Nội Bộ (WebAssembly)..."
+        );
+        const fallbackRecords = await runLocalBrowserOcr({
+          images: targetImages,
+          knownSbds: activeKnownSbds,
+          onProgress: (text, pct) => {
+            setOcrProgressText(text);
+            setOcrProgressPct(pct);
+          },
+        });
+        mergeIncomingRecords(fallbackRecords, append);
+        setOcrNotice(
+          `Đã tự động chuyển sang OCR Nội Bộ (Không cần API) và trích xuất ${fallbackRecords.length} dòng điểm.`
+        );
+      }
     } catch (err: any) {
-      setOcrError(err?.message || "Lỗi kết nối máy chủ OCR.");
+      setOcrNotice(
+        err?.message || "Bạn có thể gõ nhanh điểm ở bảng bên phải (Enter để xuống dòng)."
+      );
     } finally {
       setIsOcrRunning(false);
+      setOcrProgressText("");
+      setOcrProgressPct(0);
     }
   };
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    setOcrError(null);
 
     const newImages: UploadedImage[] = [];
     for (let i = 0; i < files.length; i++) {
@@ -420,10 +518,95 @@ if __name__ == "__main__":
     const updatedList = [...images, ...newImages];
     setImages(updatedList);
     setActiveImageIdx(updatedList.length - newImages.length);
-    await runGeminiOcrOnImages(newImages, true);
+
+    if (engineMode !== "RAPID_KEYBOARD") {
+      await executeOcrPipeline(newImages, knownSbds, true);
+    }
     if (imageInputRef.current) imageInputRef.current.value = "";
   };
 
+  // Rapid Keyboard Entry Handler: Type "8,5" -> automatically saves 8.5 for that student's SBD
+  const handleRapidScoreChange = (studentSbd: string, rawVal: string) => {
+    const normSbd = normalizeSbdClient(studentSbd);
+    if (!normSbd) return;
+
+    setRapidInputs((prev) => ({ ...prev, [normSbd]: rawVal }));
+
+    if (!rawVal.trim()) {
+      setOcrRecords((prev) => prev.filter((r) => normalizeSbdClient(r.sbd) !== normSbd));
+      setExportResult(null);
+      return;
+    }
+
+    const parsedScore = parseVietnameseScoreClient(rawVal);
+    if (parsedScore === null) return;
+
+    setOcrRecords((prev) => {
+      const exists = prev.some((r) => normalizeSbdClient(r.sbd) === normSbd);
+      if (exists) {
+        return prev.map((r) =>
+          normalizeSbdClient(r.sbd) === normSbd
+            ? {
+                ...r,
+                rawScoreText: rawVal,
+                score: parsedScore,
+                notes: `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
+              }
+            : r
+        );
+      }
+      return [
+        ...prev,
+        {
+          id: `rapid-${normSbd}-${Date.now()}`,
+          sbd: normSbd,
+          rawSbd: studentSbd,
+          score: parsedScore,
+          rawScoreText: rawVal,
+          scoreInWords: "",
+          confidence: "CAO",
+          notes: `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
+          sourceImage: "Nhập nhanh bàn phím (Zero-API)",
+        },
+      ];
+    });
+    setExportResult(null);
+  };
+
+  const handleRapidKeyDown = (
+    e: React.KeyboardEvent<HTMLInputElement>,
+    rowIdx: number,
+    totalRows: number
+  ) => {
+    if (e.key === "Enter" || e.key === "ArrowDown") {
+      e.preventDefault();
+      const nextIdx = Math.min(totalRows - 1, rowIdx + 1);
+      setActiveRapidRowIdx(nextIdx);
+      rapidInputRefs.current[nextIdx]?.focus();
+      rapidInputRefs.current[nextIdx]?.select();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      const prevIdx = Math.max(0, rowIdx - 1);
+      setActiveRapidRowIdx(prevIdx);
+      rapidInputRefs.current[prevIdx]?.focus();
+      rapidInputRefs.current[prevIdx]?.select();
+    }
+  };
+
+  const handleApplyBulkPaste = () => {
+    if (!bulkPasteText.trim()) return;
+    const parsed = parseBulkPastedScores(bulkPasteText, knownSbds);
+    if (parsed.length > 0) {
+      mergeIncomingRecords(parsed, true);
+      setOcrNotice(`Đã dán và chuẩn hóa thành công ${parsed.length} dòng điểm (Không cần API).`);
+      setShowBulkPaste(false);
+      setBulkPasteText("");
+    }
+  };
+
+  // ============================================================================
+  // STEP 3 HANDLERS: 100% Client-Side Excel Export (Preserves Formatting)
+  // ============================================================================
   const triggerBase64Download = (base64Data: string, fileName: string, mimeType: string) => {
     const clean = base64Data.includes(",") ? base64Data.split(",")[1] : base64Data;
     const byteCharacters = atob(clean);
@@ -453,32 +636,24 @@ if __name__ == "__main__":
     setExcelError(null);
 
     try {
-      const response = await fetch("/api/excel/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64: excelData.fileBase64,
-          fileName: excelData.fileName,
-          headerRow,
-          sbdCol,
-          scoreCol,
-          sheetIndex: selectedSheetIndex,
-          ocrRecords: ocrRecords.map((r) => ({
-            sbd: normalizeSbdClient(r.sbd),
-            score: r.score,
-          })),
-        }),
+      // Runs 100% in the browser using ExcelJS — works on Vercel, GitHub Pages, and offline!
+      const result = await exportUpdatedExcelClientSide({
+        fileBase64: excelData.fileBase64,
+        fileName: excelData.fileName,
+        headerRow,
+        sbdCol,
+        scoreCol,
+        sheetIndex: selectedSheetIndex,
+        ocrRecords: ocrRecords.map((r) => ({
+          sbd: normalizeSbdClient(r.sbd),
+          score: r.score,
+        })),
       });
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Lỗi khi ghi điểm vào file Excel.");
-      }
-
-      setExportResult(data);
+      setExportResult(result);
       triggerBase64Download(
-        data.updatedExcelBase64,
-        data.outputFileName,
+        result.updatedExcelBase64,
+        result.outputFileName,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       );
     } catch (err: any) {
@@ -530,7 +705,8 @@ if __name__ == "__main__":
 
   const handleAddOcrRow = () => {
     const nextIdx = ocrRecords.length + 1;
-    const defaultSbd = `K6.${String(nextIdx).padStart(3, "0")}`;
+    const defaultSbd =
+      knownSbds[nextIdx - 1] || `K6.${String(nextIdx).padStart(3, "0")}`;
     setOcrRecords((prev) => [
       ...prev,
       {
@@ -557,7 +733,7 @@ if __name__ == "__main__":
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
-      {/* Top Bar: Brand, Step Tabs, Primary Action */}
+      {/* Top Bar Contract: 3 Zones separated by gap-8 */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200">
         <a
           href="#top"
@@ -566,20 +742,24 @@ if __name__ == "__main__":
           VietGrade OCR
         </a>
 
-        {/* 3-Step Wizard Navigation */}
+        {/* 3-Step Sequential Navigation */}
         <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-lg">
           <button
             type="button"
             onClick={() => setCurrentStep(1)}
-            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 cursor-pointer ${
+            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
               currentStep === 1
                 ? "bg-white text-slate-900 shadow-xs"
                 : "text-slate-600 hover:text-slate-900"
             }`}
           >
-            <span className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono ${
-              excelData ? "bg-emerald-600 text-white" : "bg-slate-300 text-slate-700"
-            }`}>
+            <span
+              className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono ${
+                excelData
+                  ? "bg-emerald-600 text-white"
+                  : "bg-slate-300 text-slate-700"
+              }`}
+            >
               {excelData ? "✓" : "1"}
             </span>
             <span>01. Nạp File Excel Nguồn</span>
@@ -588,24 +768,28 @@ if __name__ == "__main__":
           <button
             type="button"
             onClick={() => setCurrentStep(2)}
-            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 cursor-pointer ${
+            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
               currentStep === 2
                 ? "bg-white text-slate-900 shadow-xs"
                 : "text-slate-600 hover:text-slate-900"
             }`}
           >
-            <span className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono ${
-              ocrRecords.length > 0 ? "bg-blue-600 text-white" : "bg-slate-300 text-slate-700"
-            }`}>
+            <span
+              className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono ${
+                ocrRecords.length > 0
+                  ? "bg-blue-600 text-white"
+                  : "bg-slate-300 text-slate-700"
+              }`}
+            >
               {ocrRecords.length > 0 ? "✓" : "2"}
             </span>
-            <span>02. Tải Ảnh Phiếu Chấm (OCR)</span>
+            <span>02. Quét Ảnh / Nhập Điểm (Zero-API)</span>
           </button>
 
           <button
             type="button"
             onClick={() => setCurrentStep(3)}
-            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 cursor-pointer ${
+            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
               currentStep === 3
                 ? "bg-white text-slate-900 shadow-xs"
                 : "text-slate-600 hover:text-slate-900"
@@ -630,7 +814,7 @@ if __name__ == "__main__":
             type="button"
             onClick={handleExecuteAndExport}
             disabled={isExporting || !excelData || ocrRecords.length === 0}
-            className="px-4 py-2 text-xs font-semibold text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer shadow-xs"
+            className="px-4 py-2 text-xs font-semibold text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
             <span>{isExporting ? "Đang xử lý..." : "Xuất File Excel Đã Điền Điểm"}</span>
@@ -639,23 +823,31 @@ if __name__ == "__main__":
       </header>
 
       <main id="top" className="flex-1 max-w-[1400px] w-full mx-auto px-6 py-8 space-y-8">
-        {/* Pipeline Summary Bar */}
+        {/* Pipeline Status Strip */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-white border border-slate-200 rounded-lg">
-          <div className="flex items-center gap-4">
-            <div className={`p-2.5 rounded-lg ${excelData ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
-              <FileSpreadsheet className="w-6 h-6" />
+          <div className="flex items-center gap-3.5">
+            <div
+              className={`p-2.5 rounded-lg ${
+                excelData
+                  ? "bg-emerald-50 text-emerald-700"
+                  : "bg-slate-100 text-slate-500"
+              }`}
+            >
+              <FileSpreadsheet className="w-5 h-5" />
             </div>
             <div>
-              <div className="text-xs font-medium text-slate-500">File Excel Nguồn (Bước 1):</div>
+              <div className="text-xs text-slate-500">
+                Bước 1 · File Excel Nguồn · Xử lý 100% Trực tiếp trên Trình duyệt (Tương thích GitHub &amp; Vercel)
+              </div>
               <div className="text-sm font-bold text-slate-900 font-mono">
                 {excelData ? excelData.fileName : "Chưa tải lên file Excel nguồn"}
               </div>
             </div>
           </div>
 
-          <div className="flex items-center gap-6 text-xs font-mono tabular-nums">
+          <div className="flex flex-wrap items-center gap-6 text-xs font-mono tabular-nums">
             <div>
-              <span className="text-slate-500">Học sinh trong file: </span>
+              <span className="text-slate-500">Học sinh: </span>
               <span className="font-bold text-slate-900">{stats.totalExcelStudents}</span>
             </div>
             <div>
@@ -664,29 +856,28 @@ if __name__ == "__main__":
             </div>
             <div>
               <span className="text-slate-500">Đã khớp điểm: </span>
-              <span className="font-bold text-emerald-700">{stats.matchedCount}</span>
+              <span className="font-bold text-emerald-700">
+                {stats.matchedCount}/{stats.totalExcelStudents}
+              </span>
             </div>
           </div>
         </div>
 
         {/* =====================================================================
-            BƯỚC 1: TẢI LÊN FILE EXCEL NGUỒN TRƯỚC TIÊN
+            BƯỚC 1: TẢI LÊN FILE EXCEL NGUỒN TRƯỚC TIÊN (100% CLIENT-SIDE)
            ===================================================================== */}
         {currentStep === 1 && (
           <section className="space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 text-xs font-bold text-white bg-emerald-700 rounded">
-                    BƯỚC 1
-                  </span>
-                  <h2 className="text-xl font-bold text-slate-900">
-                    Tải Lên File Excel Nguồn Cần Nhập Điểm
-                  </h2>
-                </div>
+                <h1 className="text-xl font-bold text-slate-900">
+                  01. Tải Lên File Excel Nguồn Cần Nhập Điểm
+                </h1>
                 <p className="text-xs text-slate-600 mt-1">
-                  Hãy chọn hoặc kéo thả file bảng điểm học sinh của bạn vào đây. Hệ thống sẽ đọc danh sách học sinh,
-                  xác định cột <strong>Số BD</strong> (ví dụ cột G) và cột <strong>Điểm</strong> (ví dụ cột I).
+                  Toàn bộ quá trình đọc cấu trúc bảng, nhận diện cột <strong>Số BD</strong> (cột{" "}
+                  {sbdCol}) và cột <strong>Điểm</strong> (cột {scoreCol}) chạy trực tiếp ngay trên
+                  trình duyệt của bạn — <strong>không cần máy chủ backend hay API key</strong>, hoạt
+                  động mượt mà trên cả GitHub &amp; Vercel.
                 </p>
               </div>
 
@@ -695,16 +886,16 @@ if __name__ == "__main__":
                   type="button"
                   onClick={handleLoadSampleWorkspace}
                   disabled={isExcelLoading}
-                  className="px-3.5 py-2 text-xs font-medium text-slate-600 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                  className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isExcelLoading ? "animate-spin" : ""}`} />
-                  <span>Dùng Thử File Mẫu</span>
+                  <span>Nạp Bộ Mẫu (Hình 1 + Hình 2 → Hình 3)</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => excelInputRef.current?.click()}
-                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer shadow-sm"
+                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
                 >
                   <FileUp className="w-4 h-4" />
                   <span>Chọn File Excel Từ Máy Tính</span>
@@ -719,7 +910,7 @@ if __name__ == "__main__":
               </div>
             )}
 
-            {/* Dropzone */}
+            {/* Drag and Drop Zone */}
             <div
               onDragOver={(e) => {
                 e.preventDefault();
@@ -728,64 +919,97 @@ if __name__ == "__main__":
               onDragLeave={() => setIsExcelDragging(false)}
               onDrop={handleExcelDrop}
               onClick={() => excelInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-xl p-10 transition-all text-center cursor-pointer ${
+              className={`border-2 border-dashed rounded-xl p-10 transition-colors text-center cursor-pointer ${
                 isExcelDragging
-                  ? "border-emerald-600 bg-emerald-50/80 scale-[1.005]"
-                  : "border-slate-300 hover:border-emerald-500 bg-white"
+                  ? "border-emerald-600 bg-emerald-50/80"
+                  : "border-slate-300 hover:border-emerald-600 bg-white"
               }`}
             >
               <div className="max-w-md mx-auto flex flex-col items-center space-y-3">
-                <div className="w-14 h-14 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700 shadow-xs">
-                  <FileSpreadsheet className="w-7 h-7" />
+                <div className="w-12 h-12 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
+                  <FileSpreadsheet className="w-6 h-6" />
                 </div>
                 <div className="text-base font-bold text-slate-900">
                   {excelData ? (
                     <span>
-                      Đã nạp file: <span className="text-emerald-700 font-mono">{excelData.fileName}</span>
+                      Đã nạp file nguồn:{" "}
+                      <span className="text-emerald-700 font-mono">{excelData.fileName}</span>
                     </span>
                   ) : (
-                    <span>Kéo &amp; thả file Excel nguồn (.xlsx) vào đây hoặc bấm để duyệt file</span>
+                    <span>
+                      Kéo &amp; thả file Excel nguồn (.xlsx) vào đây hoặc bấm để chọn file
+                    </span>
                   )}
                 </div>
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  Bảo toàn 100% dòng tiêu đề trường/sở (hàng 1-4), merged cells, độ rộng cột, font chữ và viền kẻ bảng.
+                  Bảo toàn 100% dòng tiêu đề trường/sở (hàng 1–4), merged cells, độ rộng cột, font
+                  chữ và viền kẻ bảng.
                 </p>
-                <div className="pt-2">
+                <div className="pt-1">
                   <span className="px-4 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-lg hover:bg-emerald-100 transition-colors inline-flex items-center gap-1.5">
                     <Upload className="w-3.5 h-3.5" />
-                    <span>{excelData ? "Đổi sang file Excel khác" : "Chọn file Excel từ máy"}</span>
+                    <span>
+                      {excelData ? "Đổi sang file Excel khác" : "Duyệt chọn file Excel (.xlsx)"}
+                    </span>
                   </span>
                 </div>
               </div>
             </div>
 
-            {/* If Excel Loaded: Show Structure Preview & Column Settings */}
+            {/* Structure Configuration & Roster Preview */}
             {excelData && (
               <div className="space-y-4 bg-white border border-slate-200 rounded-lg p-5">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200">
                   <div>
-                    <h3 className="text-sm font-bold text-slate-900">
-                      Cấu Trúc Bảng Điểm Đã Nhận Diện Thành Công
-                    </h3>
+                    <h2 className="text-sm font-bold text-slate-900">
+                      Cấu Trúc Bảng Điểm Đã Nhận Diện ({excelData.studentRows.length} học sinh)
+                    </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Kiểm tra hàng tiêu đề, cột Số BD và cột Điểm. Bạn có thể điều chỉnh lại nếu cần.
+                      Kiểm tra vị trí hàng tiêu đề, cột Số BD và cột Điểm trước khi sang Bước 2.
                     </p>
                   </div>
 
                   <button
                     type="button"
                     onClick={() => setCurrentStep(2)}
-                    className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
+                    className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
                   >
-                    <span>Tiếp tục: Bước 2 - Tải Ảnh Phiếu Chấm</span>
+                    <span>Tiếp tục: Bước 2 — Tải Ảnh &amp; Nhập Điểm</span>
                     <ArrowRight className="w-4 h-4" />
                   </button>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  {/* Sheet selector */}
                   <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <label htmlFor="step1-header-row" className="text-xs font-semibold text-slate-700 block mb-1">
-                      Hàng tiêu đề:
+                    <label
+                      htmlFor="step1-sheet"
+                      className="text-xs font-semibold text-slate-700 block mb-1"
+                    >
+                      Trang tính (Worksheet):
+                    </label>
+                    <select
+                      id="step1-sheet"
+                      value={selectedSheetIndex}
+                      onChange={(e) => handleSheetChange(Number(e.target.value))}
+                      className="w-full px-2.5 py-1.5 text-xs font-semibold border border-slate-300 rounded bg-white"
+                    >
+                      {(excelData.availableSheets || [{ index: 0, name: excelData.sheetName, rowCount: excelData.totalRows }]).map(
+                        (s) => (
+                          <option key={s.index} value={s.index}>
+                            {s.name} ({s.rowCount} hàng)
+                          </option>
+                        )
+                      )}
+                    </select>
+                  </div>
+
+                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+                    <label
+                      htmlFor="step1-header-row"
+                      className="text-xs font-semibold text-slate-700 block mb-1"
+                    >
+                      Hàng tiêu đề (Header Row):
                     </label>
                     <input
                       id="step1-header-row"
@@ -793,23 +1017,25 @@ if __name__ == "__main__":
                       min={1}
                       max={20}
                       value={headerRow}
-                      onChange={(e) => handleHeaderRowChange(Math.max(1, Number(e.target.value) || 5))}
-                      className="w-full px-2.5 py-1.5 font-mono text-sm font-semibold border border-slate-300 rounded bg-white tabular-nums"
+                      onChange={(e) =>
+                        handleHeaderRowChange(Math.max(1, Number(e.target.value) || 5))
+                      }
+                      className="w-full px-2.5 py-1.5 font-mono text-xs font-semibold border border-slate-300 rounded bg-white tabular-nums"
                     />
-                    <span className="text-[11px] text-slate-500 mt-1 block">
-                      Dữ liệu học sinh sẽ được đọc từ hàng {headerRow + 1} trở đi.
-                    </span>
                   </div>
 
                   <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <label htmlFor="step1-sbd-col" className="text-xs font-semibold text-slate-700 block mb-1">
+                    <label
+                      htmlFor="step1-sbd-col"
+                      className="text-xs font-semibold text-slate-700 block mb-1"
+                    >
                       Cột Số Báo Danh (SBD):
                     </label>
                     <select
                       id="step1-sbd-col"
                       value={sbdCol}
                       onChange={(e) => setSbdCol(e.target.value)}
-                      className="w-full px-2.5 py-1.5 font-mono text-sm font-semibold border border-slate-300 rounded bg-white"
+                      className="w-full px-2.5 py-1.5 font-mono text-xs font-semibold border border-slate-300 rounded bg-white"
                     >
                       {excelData.headers.map((h) => (
                         <option key={h.colLetter} value={h.colLetter}>
@@ -817,20 +1043,20 @@ if __name__ == "__main__":
                         </option>
                       ))}
                     </select>
-                    <span className="text-[11px] text-slate-500 mt-1 block">
-                      Cột chứa mã Số Báo Danh để đối chiếu VLOOKUP.
-                    </span>
                   </div>
 
                   <div className="p-3 bg-blue-50/60 rounded-lg border border-blue-200">
-                    <label htmlFor="step1-score-col" className="text-xs font-semibold text-blue-900 block mb-1">
+                    <label
+                      htmlFor="step1-score-col"
+                      className="text-xs font-semibold text-blue-900 block mb-1"
+                    >
                       Cột Điểm (Chỉ ghi đè cột này):
                     </label>
                     <select
                       id="step1-score-col"
                       value={scoreCol}
                       onChange={(e) => setScoreCol(e.target.value)}
-                      className="w-full px-2.5 py-1.5 font-mono text-sm font-bold text-blue-700 border border-blue-300 rounded bg-white"
+                      className="w-full px-2.5 py-1.5 font-mono text-xs font-bold text-blue-700 border border-blue-300 rounded bg-white"
                     >
                       {excelData.headers.map((h) => (
                         <option key={h.colLetter} value={h.colLetter}>
@@ -838,36 +1064,46 @@ if __name__ == "__main__":
                         </option>
                       ))}
                     </select>
-                    <span className="text-[11px] text-blue-800 mt-1 block">
-                      Điểm thi (Float) sẽ chỉ được ghi vào cột này.
-                    </span>
                   </div>
                 </div>
 
-                {/* Quick Student Roster Preview Table */}
-                <div className="mt-4 border border-slate-200 rounded-lg overflow-hidden">
+                {/* Roster Preview */}
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
                   <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700 flex justify-between items-center">
-                    <span>Xem trước {Math.min(excelData.studentRows.length, 6)} học sinh đầu tiên:</span>
-                    <span className="font-mono text-slate-500">Tổng cộng: {excelData.studentRows.length} học sinh</span>
+                    <span>
+                      Xem trước danh sách học sinh (Từ hàng {headerRow + 1} trở đi):
+                    </span>
+                    <span className="font-mono tabular-nums text-slate-500">
+                      Tổng cộng: {excelData.studentRows.length} học sinh
+                    </span>
                   </div>
-                  <div className="overflow-x-auto">
+                  <div className="overflow-x-auto max-h-[260px]">
                     <table className="w-full text-left text-xs border-collapse">
-                      <thead>
-                        <tr className="bg-slate-100 border-b border-slate-200 font-semibold text-slate-600">
-                          <th className="py-2 px-3 w-12 text-center">Hàng</th>
-                          {excelData.headers.slice(0, 7).map((h) => (
-                            <th key={h.colLetter} className="py-2 px-3">
+                      <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 font-semibold text-slate-600">
+                        <tr>
+                          <th className="py-2 px-3 w-14 text-center">Hàng</th>
+                          {excelData.headers.map((h) => (
+                            <th key={h.colLetter} className="py-2 px-3 whitespace-nowrap">
                               {h.label} ({h.colLetter})
                             </th>
                           ))}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-200">
-                        {excelData.studentRows.slice(0, 6).map((row) => (
+                        {excelData.studentRows.slice(0, 10).map((row) => (
                           <tr key={row.rowNumber} className="hover:bg-slate-50">
-                            <td className="py-2 px-3 text-center font-mono text-slate-400">{row.rowNumber}</td>
-                            {excelData.headers.slice(0, 7).map((h) => (
-                              <td key={h.colLetter} className={`py-2 px-3 ${h.colLetter === sbdCol ? "font-mono font-bold text-slate-900 bg-amber-50/50" : "text-slate-700"}`}>
+                            <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
+                              {row.rowNumber}
+                            </td>
+                            {excelData.headers.map((h) => (
+                              <td
+                                key={h.colLetter}
+                                className={`py-2 px-3 ${
+                                  h.colLetter === sbdCol
+                                    ? "font-mono font-bold text-slate-900 bg-amber-50/50 tabular-nums"
+                                    : "text-slate-700"
+                                }`}
+                              >
                                 {String(row.cells[h.colLetter] ?? "")}
                               </td>
                             ))}
@@ -883,34 +1119,32 @@ if __name__ == "__main__":
         )}
 
         {/* =====================================================================
-            BƯỚC 2: TẢI ẢNH PHIẾU CHẤM BÀI THI & CHẠY OCR CHỮ VIẾT TAY
+            BƯỚC 2: TẢI ẢNH PHIẾU CHẤM & TRÍCH XUẤT ĐIỂM (KHÔNG CẦN API / LOCAL WASM)
            ===================================================================== */}
         {currentStep === 2 && (
-          <section className="space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <section className="space-y-5">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 text-xs font-bold text-white bg-blue-700 rounded">
-                    BƯỚC 2
-                  </span>
-                  <h2 className="text-xl font-bold text-slate-900">
-                    Tải Lên Các File Ảnh Chứa Điểm (Phiếu Chấm Bài Thi)
-                  </h2>
-                </div>
+                <h1 className="text-xl font-bold text-slate-900">
+                  02. Tải Ảnh Phiếu Chấm Bài Thi &amp; Trích Xuất Điểm (Không Cần API)
+                </h1>
                 <p className="text-xs text-slate-600 mt-1">
-                  File nguồn đã nạp: <strong className="font-mono text-slate-900">{excelData?.fileName || "Chưa tải"}</strong>.
-                  Bây giờ hãy tải các ảnh chụp phiếu chấm bài thi viết tay để AI tự động trích xuất mã SBD và Điểm số.
+                  Chọn phương thức tối ưu nhất cho bạn: <strong>OCR Nội Bộ (WebAssembly)</strong> chạy
+                  100% trên trình duyệt không sợ lỗi 503, hoặc{" "}
+                  <strong>Nhập Nhanh Bàn Phím Đối Chiếu Ảnh</strong> (gõ điểm{" "}
+                  <code className="font-mono">8,5</code> + nhấn <code className="font-mono">Enter</code>{" "}
+                  tự động xuống dòng theo đúng danh sách SBD của Bước 1).
                 </p>
               </div>
 
-              <div className="flex items-center gap-3 shrink-0">
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
                 <button
                   type="button"
                   onClick={() => setCurrentStep(1)}
                   className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors flex items-center gap-1 cursor-pointer"
                 >
                   <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Quay lại Bước 1</span>
+                  <span>Bước 1</span>
                 </button>
 
                 <input
@@ -924,33 +1158,138 @@ if __name__ == "__main__":
                 <button
                   type="button"
                   onClick={() => imageInputRef.current?.click()}
-                  className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer shadow-sm"
+                  className="px-3.5 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
                 >
-                  <Upload className="w-4 h-4" />
-                  <span>Chọn Ảnh Phiếu Chấm</span>
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Tải Ảnh Phiếu Chấm</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowBulkPaste((v) => !v)}
+                  className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <ClipboardPaste className="w-3.5 h-3.5" />
+                  <span>Dán Nhanh Điểm</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setCurrentStep(3)}
                   disabled={ocrRecords.length === 0}
-                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer shadow-sm"
+                  className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
                 >
-                  <span>Sang Bước 3: Khớp Điểm</span>
+                  <span>Sang Bước 3: Xuất Excel ({stats.matchedCount})</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
             </div>
 
-            {ocrError && (
-              <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2.5 text-xs text-red-800">
-                <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
-                <span>{ocrError}</span>
+            {/* Engine Selector Bar (Zero-API Modes Highlighted) */}
+            <div className="p-3 bg-white border border-slate-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-100 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setEngineMode("LOCAL_WASM")}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                    engineMode === "LOCAL_WASM"
+                      ? "bg-white text-slate-900 shadow-xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <Cpu className="w-3.5 h-3.5 text-emerald-700" />
+                  <span>OCR Nội Bộ (WebAssembly — Không Cần API)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setEngineMode("RAPID_KEYBOARD")}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                    engineMode === "RAPID_KEYBOARD"
+                      ? "bg-white text-slate-900 shadow-xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <Keyboard className="w-3.5 h-3.5 text-blue-700" />
+                  <span>Nhập Nhanh Bàn Phím Theo SBD (1 giây/dòng — Không Cần API)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setEngineMode("HYBRID_CLOUD")}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                    engineMode === "HYBRID_CLOUD"
+                      ? "bg-white text-slate-900 shadow-xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <ScanText className="w-3.5 h-3.5 text-slate-700" />
+                  <span>AI Đa Luồng + Tự Động Dự Phòng Local</span>
+                </button>
+              </div>
+
+              {images.length > 0 && engineMode !== "RAPID_KEYBOARD" && (
+                <button
+                  type="button"
+                  onClick={() => executeOcrPipeline(images, knownSbds, false)}
+                  disabled={isOcrRunning}
+                  className="px-3.5 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isOcrRunning ? "animate-spin" : ""}`} />
+                  <span>{isOcrRunning ? "Đang quét..." : "Chạy Quét Ảnh Ngay"}</span>
+                </button>
+              )}
+            </div>
+
+            {/* Optional Bulk Paste Drawer */}
+            {showBulkPaste && (
+              <div className="p-4 bg-white border border-slate-300 rounded-lg space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold text-slate-900">
+                    Dán Nhanh Danh Sách Điểm (Không Cần API)
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowBulkPaste(false)}
+                    className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer"
+                  >
+                    Đóng
+                  </button>
+                </div>
+                <p className="text-xs text-slate-600">
+                  Dán từng dòng theo cú pháp <code className="font-mono">K6.001 8,5</code> hoặc chỉ
+                  cần dán một cột điểm (<code className="font-mono">8,5</code> xuống dòng{" "}
+                  <code className="font-mono">6,7</code>...) theo đúng thứ tự SBD của file Excel nguồn.
+                </p>
+                <textarea
+                  rows={4}
+                  value={bulkPasteText}
+                  onChange={(e) => setBulkPasteText(e.target.value)}
+                  placeholder={"K6.001  8,5\nK6.002  6,7\nK6.003  7,4"}
+                  className="w-full p-2.5 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:border-blue-600"
+                />
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleApplyBulkPaste}
+                    className="px-4 py-1.5 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
+                  >
+                    Áp Dụng Vào Bảng Điểm
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Status Notice */}
+            {ocrNotice && (
+              <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center gap-2 text-xs text-emerald-900">
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-700" />
+                <span>{ocrNotice}</span>
               </div>
             )}
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-              {/* Image Viewer */}
+              {/* Left Column (5 cols): Grading Sheet Photo Viewer */}
               <div className="lg:col-span-5 bg-white border border-slate-200 rounded-lg flex flex-col overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2 bg-slate-50">
                   <div className="flex items-center gap-2 text-xs font-medium text-slate-700 truncate">
@@ -958,7 +1297,9 @@ if __name__ == "__main__":
                     {activeImage && (
                       <>
                         <span aria-hidden="true">·</span>
-                        <span className="font-mono text-slate-500 truncate">{activeImage.name}</span>
+                        <span className="font-mono text-slate-500 truncate">
+                          {activeImage.name}
+                        </span>
                       </>
                     )}
                   </div>
@@ -1005,7 +1346,7 @@ if __name__ == "__main__":
                   </div>
                 )}
 
-                <div className="flex-1 min-h-[420px] max-h-[540px] overflow-auto bg-slate-100 p-4 flex items-start justify-center">
+                <div className="flex-1 min-h-[440px] max-h-[540px] overflow-auto bg-slate-100 p-4 flex items-start justify-center">
                   {activeImage ? (
                     <img
                       src={activeImage.dataUrl}
@@ -1021,162 +1362,435 @@ if __name__ == "__main__":
                     <div className="my-auto text-center p-8 space-y-3">
                       <ScanText className="w-8 h-8 text-slate-400 mx-auto" />
                       <div className="text-sm font-semibold text-slate-700">
-                        Chưa có ảnh Phiếu Chấm Bài Thi nào được chọn
+                        Tải ảnh chụp "PHIẾU CHẤM BÀI THI"
                       </div>
                       <p className="text-xs text-slate-500 max-w-xs mx-auto">
-                        Tải lên một hoặc nhiều ảnh chụp bảng điểm viết tay để AI tự động nhận diện chữ số.
+                        Tải ảnh lên để quét bằng OCR Nội Bộ (WebAssembly) hoặc vừa nhìn ảnh vừa gõ
+                        điểm siêu tốc bên phải.
                       </p>
                       <button
                         type="button"
                         onClick={() => imageInputRef.current?.click()}
                         className="px-4 py-2 text-xs font-bold text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors cursor-pointer"
                       >
-                        Chọn ảnh phiếu chấm từ máy tính
+                        Chọn ảnh phiếu chấm từ máy
                       </button>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* Extracted OCR Table */}
+              {/* Right Column (7 cols): Either Rapid Keyboard Grid by Excel SBD OR Extracted OCR Table */}
               <div className="lg:col-span-7 bg-white border border-slate-200 rounded-lg flex flex-col overflow-hidden">
-                <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-4 bg-slate-50">
-                  <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
-                    <span>Kết Quả OCR (SBD — Điểm Số)</span>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono tabular-nums text-slate-500">
-                      {ocrRecords.length} bản ghi
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleAddOcrRow}
-                      className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 cursor-pointer"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Thêm dòng</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => runGeminiOcrOnImages(images, false)}
-                      disabled={isOcrRunning || images.length === 0}
-                      className="px-2.5 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 cursor-pointer"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${isOcrRunning ? "animate-spin" : ""}`} />
-                      <span>Quét lại</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="flex-1 overflow-auto max-h-[540px]">
-                  {isOcrRunning ? (
-                    <div className="p-8 space-y-3">
-                      <div className="flex items-center gap-2 text-xs font-medium text-blue-700">
-                        <RefreshCw className="w-4 h-4 animate-spin" />
-                        <span>
-                          AI đang phân tích nét số viết tay (1 vs 7 gạch ngang, 4 hở/kín, dấu phẩy thập phân)...
-                        </span>
+                {engineMode === "RAPID_KEYBOARD" && excelData ? (
+                  <>
+                    <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-4 bg-blue-50/60">
+                      <div className="text-xs font-semibold text-blue-950">
+                        Nhập Nhanh Theo Danh Sách SBD File Nguồn (Gõ{" "}
+                        <code className="font-mono">8,5</code> + nhấn{" "}
+                        <code className="font-mono">Enter</code> để tự động xuống dòng)
                       </div>
-                      {[1, 2, 3, 4, 5, 6].map((n) => (
-                        <div
-                          key={n}
-                          className="h-9 bg-slate-100 animate-pulse rounded border border-slate-200"
-                        />
-                      ))}
+                      <span className="text-xs font-mono tabular-nums text-blue-800 font-bold">
+                        Đã nhập: {stats.matchedCount}/{excelData.studentRows.length}
+                      </span>
                     </div>
-                  ) : ocrRecords.length === 0 ? (
-                    <div className="p-12 text-center space-y-2">
-                      <div className="text-sm font-medium text-slate-700">
-                        Chưa có dữ liệu SBD &amp; Điểm từ ảnh
-                      </div>
-                      <p className="text-xs text-slate-500">
-                        Nhấn nút "Chọn Ảnh Phiếu Chấm" để bắt đầu nhận diện.
-                      </p>
-                    </div>
-                  ) : (
-                    <table className="w-full text-left border-collapse">
-                      <thead>
-                        <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-semibold text-slate-600">
-                          <th className="py-2.5 px-3 w-12 text-center">#</th>
-                          <th className="py-2.5 px-3">SBD Chuẩn Hóa</th>
-                          <th className="py-2.5 px-3">Điểm Viết Tay (Gốc)</th>
-                          <th className="py-2.5 px-3 text-right">Điểm Chuẩn (Float)</th>
-                          <th className="py-2.5 px-3">Đối Chiếu Điểm Chữ</th>
-                          <th className="py-2.5 px-3 w-12 text-center">Xóa</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-200 text-xs">
-                        {ocrRecords.map((rec, index) => {
-                          const isMatchedInExcel = excelData
-                            ? excelData.studentRows.some(
-                                (r) =>
-                                  normalizeSbdClient(r.cells[sbdCol] ?? r.sbd) ===
-                                  normalizeSbdClient(rec.sbd)
-                              )
-                            : false;
 
-                          return (
-                            <tr key={rec.id} className="hover:bg-slate-50/80 transition-colors">
-                              <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
-                                {index + 1}
-                              </td>
-                              <td className="py-2 px-3">
-                                <div className="flex items-center gap-2">
+                    <div className="flex-1 overflow-auto max-h-[540px]">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
+                          <tr>
+                            <th className="py-2.5 px-3 w-12 text-center">Hàng</th>
+                            <th className="py-2.5 px-3">Số Báo Danh (Cột {sbdCol})</th>
+                            <th className="py-2.5 px-3">Họ và tên / Thông tin</th>
+                            <th className="py-2.5 px-3 w-36">Gõ Điểm (VD: 8,5)</th>
+                            <th className="py-2.5 px-3 text-right w-28">
+                              Điểm Chuẩn (Cột {scoreCol})
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {matchedStudentRows.map((row, rIdx) => {
+                            const norm = row.normalizedSbd;
+                            const inputVal =
+                              rapidInputs[norm] ??
+                              (row.matchedRawText !== null ? row.matchedRawText : "");
+                            const studentName =
+                              row.cells["C"] ||
+                              row.cells["B"] ||
+                              Object.values(row.cells).find(
+                                (v) => typeof v === "string" && v !== row.displaySbd
+                              ) ||
+                              "";
+
+                            return (
+                              <tr
+                                key={row.rowNumber}
+                                className={`transition-colors ${
+                                  activeRapidRowIdx === rIdx
+                                    ? "bg-blue-50/70"
+                                    : "hover:bg-slate-50"
+                                }`}
+                              >
+                                <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
+                                  {row.rowNumber}
+                                </td>
+                                <td className="py-2 px-3 font-mono font-bold text-slate-900 tabular-nums">
+                                  {row.displaySbd}
+                                </td>
+                                <td className="py-2 px-3 text-slate-700 truncate max-w-[200px]">
+                                  {String(studentName)}
+                                </td>
+                                <td className="py-1.5 px-3">
                                   <input
+                                    ref={(el) => {
+                                      rapidInputRefs.current[rIdx] = el;
+                                    }}
                                     type="text"
-                                    value={rec.sbd}
-                                    onChange={(e) => handleUpdateOcrRow(rec.id, "sbd", e.target.value)}
-                                    className="w-28 px-2 py-1 font-mono font-semibold text-slate-900 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
+                                    placeholder="VD: 8,5"
+                                    value={inputVal}
+                                    onFocus={() => setActiveRapidRowIdx(rIdx)}
+                                    onChange={(e) =>
+                                      handleRapidScoreChange(row.displaySbd, e.target.value)
+                                    }
+                                    onKeyDown={(e) =>
+                                      handleRapidKeyDown(
+                                        e,
+                                        rIdx,
+                                        matchedStudentRows.length
+                                      )
+                                    }
+                                    className="w-28 px-2.5 py-1 font-mono font-semibold text-slate-900 bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 tabular-nums"
                                   />
-                                  {isMatchedInExcel ? (
-                                    <span className="text-[11px] text-emerald-700 font-medium whitespace-nowrap">
-                                      ✓ Khớp Excel
-                                    </span>
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono font-bold tabular-nums text-sm">
+                                  {row.matchedScore !== null ? (
+                                    <span className="text-emerald-700">{row.matchedScore}</span>
                                   ) : (
-                                    <span className="text-[11px] text-amber-700 font-medium whitespace-nowrap">
-                                      ! Ngoài DS
+                                    <span className="text-slate-300 font-normal text-xs">
+                                      Trống
                                     </span>
                                   )}
-                                </div>
-                              </td>
-                              <td className="py-2 px-3">
-                                <input
-                                  type="text"
-                                  value={rec.rawScoreText}
-                                  onChange={(e) =>
-                                    handleUpdateOcrRow(rec.id, "rawScoreText", e.target.value)
-                                  }
-                                  className="w-20 px-2 py-1 font-mono text-slate-700 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
-                                />
-                              </td>
-                              <td className="py-2 px-3 text-right font-mono font-bold text-blue-700 tabular-nums text-sm">
-                                {rec.score}
-                              </td>
-                              <td className="py-2 px-3 text-slate-600 truncate max-w-[200px]">
-                                {rec.scoreInWords ? `"${rec.scoreInWords}"` : rec.notes}
-                              </td>
-                              <td className="py-2 px-3 text-center">
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteOcrRow(rec.id)}
-                                  className="p-1 text-slate-400 hover:text-red-600 rounded transition-colors cursor-pointer"
-                                  title="Xóa dòng này"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </td>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-4 bg-slate-50">
+                      <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                        <span>Bảng Kết Quả OCR (SBD — Điểm Số)</span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono tabular-nums text-slate-500">
+                          {ocrRecords.length} bản ghi
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setEngineMode("RAPID_KEYBOARD")}
+                          className="px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors cursor-pointer"
+                        >
+                          Chuyển sang Gõ Nhanh theo SBD
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleAddOcrRow}
+                          className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 transition-colors flex items-center gap-1 cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>Thêm dòng</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex-1 overflow-auto max-h-[540px]">
+                      {isOcrRunning ? (
+                        <div className="p-8 space-y-3">
+                          <div className="flex items-center justify-between text-xs font-medium text-blue-700">
+                            <div className="flex items-center gap-2">
+                              <RefreshCw className="w-4 h-4 animate-spin" />
+                              <span>{ocrProgressText || "Đang xử lý ảnh phiếu chấm..."}</span>
+                            </div>
+                            <span className="font-mono tabular-nums">{ocrProgressPct}%</span>
+                          </div>
+                          <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-blue-600 transition-all duration-200"
+                              style={{ width: `${ocrProgressPct}%` }}
+                            />
+                          </div>
+                          {[1, 2, 3, 4, 5].map((n) => (
+                            <div
+                              key={n}
+                              className="h-9 bg-slate-100 animate-pulse rounded border border-slate-200"
+                            />
+                          ))}
+                        </div>
+                      ) : ocrRecords.length === 0 ? (
+                        <div className="p-12 text-center space-y-3">
+                          <div className="text-sm font-semibold text-slate-700">
+                            Chưa có dữ liệu điểm nào
+                          </div>
+                          <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                            Tải ảnh Phiếu Chấm Bài Thi để quét bằng{" "}
+                            <strong>OCR Nội Bộ (WebAssembly — Không cần API)</strong> hoặc bấm nút
+                            bên dưới để gõ điểm trực tiếp theo danh sách SBD.
+                          </p>
+                          <div className="flex items-center justify-center gap-3 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => imageInputRef.current?.click()}
+                              className="px-3.5 py-2 text-xs font-bold text-white bg-blue-700 rounded-lg hover:bg-blue-800 cursor-pointer"
+                            >
+                              Tải Ảnh Phiếu Chấm
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEngineMode("RAPID_KEYBOARD")}
+                              className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+                            >
+                              Gõ Nhanh Theo SBD (1 giây/học sinh)
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-semibold text-slate-600">
+                              <th className="py-2.5 px-3 w-12 text-center">#</th>
+                              <th className="py-2.5 px-3">SBD Chuẩn Hóa</th>
+                              <th className="py-2.5 px-3">Điểm Gốc (Dấu phẩy)</th>
+                              <th className="py-2.5 px-3 text-right">Điểm Chuẩn (Float)</th>
+                              <th className="py-2.5 px-3">Ghi Chú Xác Thực</th>
+                              <th className="py-2.5 px-3 w-12 text-center">Xóa</th>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200 text-xs">
+                            {ocrRecords.map((rec, index) => {
+                              const isMatchedInExcel = knownSbds.includes(
+                                normalizeSbdClient(rec.sbd)
+                              );
+
+                              return (
+                                <tr
+                                  key={rec.id}
+                                  className="hover:bg-slate-50/80 transition-colors"
+                                >
+                                  <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
+                                    {index + 1}
+                                  </td>
+                                  <td className="py-2 px-3">
+                                    <div className="flex items-center gap-2">
+                                      <input
+                                        type="text"
+                                        value={rec.sbd}
+                                        onChange={(e) =>
+                                          handleUpdateOcrRow(rec.id, "sbd", e.target.value)
+                                        }
+                                        className="w-28 px-2 py-1 font-mono font-semibold text-slate-900 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
+                                      />
+                                      {isMatchedInExcel ? (
+                                        <span className="text-[11px] text-emerald-700 font-medium whitespace-nowrap">
+                                          ✓ Khớp Excel
+                                        </span>
+                                      ) : (
+                                        <span className="text-[11px] text-amber-700 font-medium whitespace-nowrap">
+                                          ! Ngoài DS
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="py-2 px-3">
+                                    <input
+                                      type="text"
+                                      value={rec.rawScoreText}
+                                      onChange={(e) =>
+                                        handleUpdateOcrRow(
+                                          rec.id,
+                                          "rawScoreText",
+                                          e.target.value
+                                        )
+                                      }
+                                      className="w-20 px-2 py-1 font-mono text-slate-700 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
+                                    />
+                                  </td>
+                                  <td className="py-2 px-3 text-right font-mono font-bold text-blue-700 tabular-nums text-sm">
+                                    {rec.score}
+                                  </td>
+                                  <td className="py-2 px-3 text-slate-600 truncate max-w-[220px]">
+                                    {rec.notes}
+                                  </td>
+                                  <td className="py-2 px-3 text-center">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteOcrRow(rec.id)}
+                                      className="p-1 text-slate-400 hover:text-red-600 rounded transition-colors cursor-pointer"
+                                      title="Xóa dòng này"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             </div>
+
+            {/* Live Matched Excel Preview (Hình 3: Kết Quả So Khớp SBD Hình 1 × Hình 2) */}
+            {excelData && ocrRecords.length > 0 && (
+              <div className="bg-white border-2 border-emerald-600/80 rounded-lg overflow-hidden shadow-xs">
+                <div className="px-4 py-3 bg-emerald-50/80 border-b border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                      <span>
+                        KẾT QUẢ SO KHỚP CỘT SBD (HÌNH 1 × HÌNH 2 → HÌNH 3): Đã khớp{" "}
+                        {stats.matchedCount}/{stats.totalExcelStudents} học sinh
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-emerald-800 mt-0.5">
+                      Đối chiếu cột <strong>SBD</strong> trên Phiếu Chấm (Hình 1) với cột{" "}
+                      <strong>Số BD (Cột {sbdCol})</strong> trên File Excel (Hình 2) và điền điểm số
+                      thập phân vào cột <strong>Điểm (Cột {scoreCol})</strong> đúng chuẩn Hình 3.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setCurrentStep(3)}
+                      className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer"
+                    >
+                      Xem Mã Python Openpyxl
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExecuteAndExport}
+                      disabled={isExporting}
+                      className="px-4 py-2 text-xs font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>
+                        {isExporting
+                          ? "Đang xuất file..."
+                          : "Tải File Excel Hoàn Chỉnh Như Hình 3 (.xlsx)"}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Excel Sheet Title Header Reproduction (Rows 1-4) */}
+                <div className="px-5 py-3 bg-white border-b border-slate-200 text-xs font-serif text-slate-900">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                    <div>
+                      <div className="text-[13px] tracking-tight">
+                        SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH
+                      </div>
+                      <div className="text-[13px] font-bold pl-8">TRƯỜNG THCS MỸ XÁ</div>
+                    </div>
+                  </div>
+                  <div className="text-center font-bold text-sm mt-1">
+                    BẢNG ĐIỂM THI MÔN: VĂN 6
+                  </div>
+                </div>
+
+                {/* Matched Excel Table (Exact Hình 3 Layout) */}
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="text-[11px] font-mono text-slate-500 bg-slate-100 border-b border-slate-300">
+                        <th className="py-1 px-2 text-center border-r border-slate-300 w-10">
+                          Hàng
+                        </th>
+                        {excelData.headers.map((h) => (
+                          <th
+                            key={h.colLetter}
+                            className={`py-1 px-2.5 text-center border-r border-slate-300 ${
+                              h.colLetter === sbdCol
+                                ? "bg-amber-100 text-amber-900 font-bold"
+                                : h.colLetter === scoreCol
+                                ? "bg-emerald-100 text-emerald-900 font-bold"
+                                : ""
+                            }`}
+                          >
+                            {h.colLetter}
+                          </th>
+                        ))}
+                      </tr>
+                      <tr className="bg-[#D9D9D9] text-slate-900 font-bold border-b border-slate-400">
+                        <th className="py-2 px-2 text-center font-mono text-[11px] text-slate-600 bg-slate-100 border-r border-slate-300">
+                          {headerRow}
+                        </th>
+                        {excelData.headers.map((h) => (
+                          <th
+                            key={h.colLetter}
+                            className="py-2 px-3 text-center border-r border-slate-400 whitespace-nowrap"
+                          >
+                            {h.label}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-300">
+                      {matchedStudentRows.map((row) => (
+                        <tr key={row.rowNumber} className="hover:bg-slate-50">
+                          <td className="py-2 px-2 text-center font-mono text-[11px] text-slate-500 bg-slate-50 border-r border-slate-300 tabular-nums">
+                            {row.rowNumber}
+                          </td>
+                          {excelData.headers.map((h) => {
+                            const isScore = h.colLetter === scoreCol;
+                            const isSbd = h.colLetter === sbdCol;
+                            const isName = h.colLetter === "B";
+                            const val = row.cells[h.colLetter];
+
+                            if (isScore) {
+                              return (
+                                <td
+                                  key={h.colLetter}
+                                  className={`py-2 px-3 text-center font-mono tabular-nums border-r border-slate-300 ${
+                                    row.isMatched
+                                      ? "bg-emerald-50/70 font-bold text-slate-900"
+                                      : "text-slate-400"
+                                  }`}
+                                >
+                                  {row.isMatched ? row.matchedScore : ""}
+                                </td>
+                              );
+                            }
+
+                            return (
+                              <td
+                                key={h.colLetter}
+                                className={`py-2 px-3 border-r border-slate-300 ${
+                                  isSbd
+                                    ? "text-center font-mono font-semibold text-slate-900 bg-amber-50/30 tabular-nums"
+                                    : isName
+                                    ? "text-left text-slate-900"
+                                    : "text-center text-slate-800 tabular-nums"
+                                }`}
+                              >
+                                {val !== null && val !== undefined ? String(val) : ""}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </section>
         )}
 
@@ -1187,18 +1801,17 @@ if __name__ == "__main__":
           <section className="space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 text-xs font-bold text-white bg-blue-900 rounded">
-                    BƯỚC 3
-                  </span>
-                  <h2 className="text-xl font-bold text-slate-900">
-                    Đối Chiếu Khớp Điểm &amp; Xuất File Excel (Bảo Toàn Định Dạng)
-                  </h2>
-                </div>
+                <h1 className="text-xl font-bold text-slate-900">
+                  03. Đối Chiếu Khớp Điểm &amp; Xuất File Excel Bảo Toàn Định Dạng
+                </h1>
                 <p className="text-xs text-slate-600 mt-1">
-                  Đã khớp <strong className="text-emerald-700 font-mono">{stats.matchedCount}</strong> điểm học sinh.
-                  Chỉ ghi đè giá trị Float vào cột <strong>Điểm (Cột {scoreCol})</strong>, không làm vỡ các vùng gộp ô,
-                  tiêu đề hay viền kẻ bảng của file nguồn.
+                  Đã khớp{" "}
+                  <strong className="text-emerald-700 font-mono tabular-nums">
+                    {stats.matchedCount}
+                  </strong>{" "}
+                  học sinh. Chỉ ghi đè giá trị Float vào cột{" "}
+                  <strong>Điểm (Cột {scoreCol})</strong>, giữ nguyên 100% các vùng gộp ô, tiêu đề và
+                  viền kẻ bảng của file nguồn.
                 </p>
               </div>
 
@@ -1216,7 +1829,7 @@ if __name__ == "__main__":
                   type="button"
                   onClick={handleExecuteAndExport}
                   disabled={isExporting || !excelData || ocrRecords.length === 0}
-                  className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer shadow-sm"
+                  className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
                   <span>{isExporting ? "Đang xử lý..." : "Tải File Excel Đã Điền Điểm"}</span>
@@ -1240,7 +1853,9 @@ if __name__ == "__main__":
                       type="button"
                       onClick={() => setRowFilter("ALL")}
                       className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "ALL" ? "bg-white text-slate-900 shadow-xs" : "text-slate-600"
+                        rowFilter === "ALL"
+                          ? "bg-white text-slate-900 shadow-xs"
+                          : "text-slate-600"
                       }`}
                     >
                       Tất cả ({stats.totalExcelStudents})
@@ -1249,7 +1864,9 @@ if __name__ == "__main__":
                       type="button"
                       onClick={() => setRowFilter("MATCHED")}
                       className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "MATCHED" ? "bg-white text-emerald-800 shadow-xs" : "text-slate-600"
+                        rowFilter === "MATCHED"
+                          ? "bg-white text-emerald-800 shadow-xs"
+                          : "text-slate-600"
                       }`}
                     >
                       Đã khớp ({stats.matchedCount})
@@ -1258,7 +1875,9 @@ if __name__ == "__main__":
                       type="button"
                       onClick={() => setRowFilter("UNMATCHED")}
                       className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "UNMATCHED" ? "bg-white text-amber-800 shadow-xs" : "text-slate-600"
+                        rowFilter === "UNMATCHED"
+                          ? "bg-white text-amber-800 shadow-xs"
+                          : "text-slate-600"
                       }`}
                     >
                       Giữ trống ({stats.unmatchedExcelCount})
@@ -1278,11 +1897,13 @@ if __name__ == "__main__":
                 </div>
               </div>
 
-              <div className="overflow-x-auto max-h-[440px]">
+              <div className="overflow-x-auto max-h-[420px]">
                 <table className="w-full text-left border-collapse text-xs">
                   <thead className="sticky top-0 z-10 bg-slate-100 border-b border-slate-300">
                     <tr className="text-[11px] font-mono text-slate-500 bg-slate-200/60 border-b border-slate-300">
-                      <th className="py-1 px-2.5 text-center border-r border-slate-300 w-14">Hàng</th>
+                      <th className="py-1 px-2.5 text-center border-r border-slate-300 w-14">
+                        Hàng
+                      </th>
                       {excelData?.headers.map((h) => (
                         <th
                           key={h.colLetter}
@@ -1294,26 +1915,47 @@ if __name__ == "__main__":
                               : ""
                           }`}
                         >
-                          {h.colLetter} {h.colLetter === sbdCol ? "(Số BD)" : h.colLetter === scoreCol ? "(Điểm - Ghi đè)" : ""}
+                          {h.colLetter}{" "}
+                          {h.colLetter === sbdCol
+                            ? "(Số BD)"
+                            : h.colLetter === scoreCol
+                            ? "(Điểm - Ghi đè)"
+                            : ""}
                         </th>
                       ))}
                       <th className="py-1 px-3 text-left">Trạng thái VLOOKUP</th>
                     </tr>
 
                     <tr className="text-xs font-semibold text-slate-800 bg-slate-100">
-                      <th className="py-2 px-2.5 text-center font-mono text-slate-500 border-r border-slate-300">{headerRow}</th>
+                      <th className="py-2 px-2.5 text-center font-mono text-slate-500 border-r border-slate-300">
+                        {headerRow}
+                      </th>
                       {excelData?.headers.map((h) => (
-                        <th key={h.colLetter} className={`py-2 px-3 border-r border-slate-200 whitespace-nowrap ${h.colLetter === scoreCol ? "bg-blue-50 text-blue-900 font-bold" : ""}`}>
+                        <th
+                          key={h.colLetter}
+                          className={`py-2 px-3 border-r border-slate-200 whitespace-nowrap ${
+                            h.colLetter === scoreCol
+                              ? "bg-blue-50 text-blue-900 font-bold"
+                              : ""
+                          }`}
+                        >
                           {h.label}
                         </th>
                       ))}
-                      <th className="py-2 px-3 whitespace-nowrap text-slate-600">Đối chiếu OCR → Excel</th>
+                      <th className="py-2 px-3 whitespace-nowrap text-slate-600">
+                        Đối chiếu Điểm → Excel
+                      </th>
                     </tr>
                   </thead>
 
                   <tbody className="divide-y divide-slate-200">
                     {filteredStudentRows.map((row) => (
-                      <tr key={row.rowNumber} className={`hover:bg-slate-50 transition-colors ${row.isMatched ? "" : "bg-slate-50/40"}`}>
+                      <tr
+                        key={row.rowNumber}
+                        className={`hover:bg-slate-50 transition-colors ${
+                          row.isMatched ? "" : "bg-slate-50/40"
+                        }`}
+                      >
                         <td className="py-2 px-2.5 text-center font-mono tabular-nums text-slate-400 bg-slate-50 border-r border-slate-200">
                           {row.rowNumber}
                         </td>
@@ -1327,24 +1969,40 @@ if __name__ == "__main__":
                               <td
                                 key={h.colLetter}
                                 className={`py-2 px-3 border-r border-slate-200 font-mono tabular-nums text-right ${
-                                  row.isMatched ? "bg-blue-50/60 font-bold text-blue-700" : "text-slate-400 italic"
+                                  row.isMatched
+                                    ? "bg-blue-50/60 font-bold text-blue-700"
+                                    : "text-slate-400 italic"
                                 }`}
                               >
                                 {row.isMatched ? (
                                   <div className="flex items-center justify-end gap-1.5">
-                                    <span className="text-[11px] font-normal text-slate-400">{scoreCol}{row.rowNumber}:</span>
+                                    <span className="text-[11px] font-normal text-slate-400">
+                                      {scoreCol}
+                                      {row.rowNumber}:
+                                    </span>
                                     <span className="text-sm">{row.matchedScore}</span>
                                   </div>
                                 ) : (
-                                  <span className="text-[11px] not-italic text-slate-400">(Trống)</span>
+                                  <span className="text-[11px] not-italic text-slate-400">
+                                    (Trống)
+                                  </span>
                                 )}
                               </td>
                             );
                           }
 
                           return (
-                            <td key={h.colLetter} className={`py-2 px-3 border-r border-slate-200 ${isSbd ? "font-mono font-bold text-slate-900 bg-amber-50/40" : "text-slate-700"}`}>
-                              {rawCellVal !== null && rawCellVal !== undefined ? String(rawCellVal) : ""}
+                            <td
+                              key={h.colLetter}
+                              className={`py-2 px-3 border-r border-slate-200 ${
+                                isSbd
+                                  ? "font-mono font-bold text-slate-900 bg-amber-50/40 tabular-nums"
+                                  : "text-slate-700"
+                              }`}
+                            >
+                              {rawCellVal !== null && rawCellVal !== undefined
+                                ? String(rawCellVal)
+                                : ""}
                             </td>
                           );
                         })}
@@ -1374,7 +2032,7 @@ if __name__ == "__main__":
               </div>
             </div>
 
-            {/* Python Code & Export Card */}
+            {/* Python Code & Client-Side Export Card */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
               <div className="lg:col-span-7 bg-[#0F172A] text-slate-100 rounded-lg border border-slate-800 flex flex-col overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between bg-slate-900/80">
@@ -1389,7 +2047,11 @@ if __name__ == "__main__":
                       onClick={handleCopyCode}
                       className="px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded transition-colors flex items-center gap-1.5 cursor-pointer"
                     >
-                      {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      {copiedCode ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
                       <span>{copiedCode ? "Đã chép" : "Sao chép"}</span>
                     </button>
                     <button
@@ -1411,9 +2073,9 @@ if __name__ == "__main__":
                 <div className="space-y-3">
                   <div className="flex items-start justify-between">
                     <div>
-                      <h3 className="text-sm font-bold text-slate-900">
-                        Kiểm Định Bảo Toàn Định Dạng Excel
-                      </h3>
+                      <h2 className="text-sm font-bold text-slate-900">
+                        Xuất File Excel Trực Tiếp (Không Cần Server/API)
+                      </h2>
                       <p className="text-xs text-slate-500 mt-0.5">
                         Chỉ ghi đè giá trị Float vào cột {scoreCol}, bảo toàn 100% định dạng.
                       </p>
@@ -1424,7 +2086,9 @@ if __name__ == "__main__":
                   <div className="space-y-2 text-xs border-t border-b border-slate-200 py-3">
                     <div className="flex justify-between">
                       <span className="text-slate-600">Tiêu đề Sở/Trường:</span>
-                      <span className="font-mono text-emerald-700 font-medium">Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)</span>
+                      <span className="font-mono text-emerald-700 font-medium">
+                        Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
+                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-600">Font chữ &amp; Khung viền:</span>
@@ -1447,10 +2111,14 @@ if __name__ == "__main__":
                   type="button"
                   onClick={handleExecuteAndExport}
                   disabled={isExporting || !excelData || ocrRecords.length === 0}
-                  className="w-full px-4 py-2.5 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-sm"
+                  className="w-full px-4 py-2.5 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
-                  <span>{exportResult ? `Tải Lại ${exportResult.outputFileName}` : "Xuất & Tải File Excel Đã Nhập Điểm"}</span>
+                  <span>
+                    {exportResult
+                      ? `Tải Lại ${exportResult.outputFileName}`
+                      : "Xuất & Tải File Excel Đã Nhập Điểm"}
+                  </span>
                 </button>
               </div>
             </div>
@@ -1460,8 +2128,10 @@ if __name__ == "__main__":
 
       <footer className="mt-12 border-t border-slate-200 bg-white py-4 px-6">
         <div className="max-w-[1400px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>Quy trình 3 bước chuẩn: Tải file Excel nguồn → Tải ảnh phiếu chấm → Khớp VLOOKUP &amp; Xuất file</span>
-          <span>Bảo toàn 100% định dạng openpyxl · Số thực Float/Number</span>
+          <span>
+            Hoạt động độc lập 100% trên trình duyệt (GitHub &amp; Vercel Ready) · Không phụ thuộc API
+          </span>
+          <span>Bảo toàn 100% định dạng Excel · Số thực Float/Number</span>
         </div>
       </footer>
     </div>
