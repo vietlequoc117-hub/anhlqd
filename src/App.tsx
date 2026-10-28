@@ -1492,13 +1492,6 @@ if __name__ == "__main__":
                           <div className="flex items-center justify-center gap-3">
                             <button
                               type="button"
-                              onClick={() => imageInputRef.current?.click()}
-                              className="px-3.5 py-2 text-xs font-bold text-white bg-blue-700 rounded-lg hover:bg-blue-800 cursor-pointer"
-                            >
-                              Tải Ảnh Phiếu Chấm
-                            </button>
-                            <button
-                              type="button"
                               onClick={() => setEngineMode("RAPID_KEYBOARD")}
                               className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
                             >
