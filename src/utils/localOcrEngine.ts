@@ -2,6 +2,7 @@ import Tesseract from "tesseract.js";
 import {
   OcrRecord,
   normalizeSbdClient,
+  canonicalSbdKey,
   parseVietnameseScoreClient,
 } from "./sampleGradingSheet";
 
@@ -101,121 +102,75 @@ export function parseScoreFromVietnameseWords(text: string): {
   return null;
 }
 
-interface ImageInspectionResult {
-  processedDataUrl: string;
-  width: number;
-  height: number;
-  hasRedHandwritingInScoreCol: boolean;
-  redRowSignals: boolean[];
-}
-
 /**
- * Preprocesses an image on an HTML5 canvas to improve local OCR accuracy,
- * specifically preserving RED ballpoint ink (R >> G, B) as well as blue/black ink,
- * and analyzing red-ink presence across the rows of the "ĐIỂM BẰNG SỐ" column.
+ * Adaptive image preprocessor for smartphone photos of grading sheets (e.g. p3_van.jpg):
+ * - Computes local background illumination so gray/shadowed paper becomes pure white (255)
+ * - Boosts red/crimson ballpoint pen ink (R >> G, B) and blue/black ink into high-contrast black strokes (0)
  */
-async function inspectAndPreprocessImage(
-  dataUrl: string
-): Promise<ImageInspectionResult> {
+async function preprocessGradingSheetForOcr(dataUrl: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
       const canvas = document.createElement("canvas");
       const scale = img.width < 1200 ? 1.5 : 1;
-      canvas.width = Math.round(img.width * scale);
-      canvas.height = Math.round(img.height * scale);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      canvas.width = w;
+      canvas.height = h;
       const ctx = canvas.getContext("2d");
       if (!ctx) {
-        resolve({
-          processedDataUrl: dataUrl,
-          width: img.width,
-          height: img.height,
-          hasRedHandwritingInScoreCol: false,
-          redRowSignals: [],
-        });
+        resolve(dataUrl);
         return;
       }
 
       ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
 
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, w, h);
       const data = imageData.data;
 
-      // Analyze 7 horizontal row bands in the "ĐIỂM BẰNG SỐ" column (x: 25%..42%, y: 18%..96%)
-      const scoreColXStart = Math.floor(canvas.width * 0.25);
-      const scoreColXEnd = Math.floor(canvas.width * 0.42);
-      const tableBodyYStart = Math.floor(canvas.height * 0.17);
-      const tableBodyYEnd = Math.floor(canvas.height * 0.96);
-      const numBands = 7;
-      const bandHeight = Math.max(
-        1,
-        Math.floor((tableBodyYEnd - tableBodyYStart) / numBands)
-      );
-      const redPixelCounts = new Array<number>(numBands).fill(0);
+      // Estimate median/mean paper luminance across the image
+      let lumSum = 0;
+      let sampleCount = 0;
+      for (let i = 0; i < data.length; i += 64) {
+        lumSum += 0.25 * data[i] + 0.45 * data[i + 1] + 0.3 * data[i + 2];
+        sampleCount++;
+      }
+      const avgPaperLum = sampleCount > 0 ? lumSum / sampleCount : 190;
+      const darkThreshold = Math.min(185, Math.max(115, avgPaperLum - 26));
 
-      for (let y = 0; y < canvas.height; y++) {
-        for (let x = 0; x < canvas.width; x++) {
-          const i = (y * canvas.width + x) * 4;
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
 
-          // Detect red/crimson ballpoint pen ink (high R compared to G and B)
-          const redness = r - Math.max(g, b);
-          const isRedInk = redness > 18 && r > 90 && g < 185;
+        const redness = r - Math.max(g, b);
+        const blueness = b - Math.max(r, g);
+        const lum = 0.25 * r + 0.45 * g + 0.3 * b;
 
-          if (
-            isRedInk &&
-            x >= scoreColXStart &&
-            x <= scoreColXEnd &&
-            y >= tableBodyYStart &&
-            y < tableBodyYEnd
-          ) {
-            const bandIdx = Math.min(
-              numBands - 1,
-              Math.floor((y - tableBodyYStart) / bandHeight)
-            );
-            redPixelCounts[bandIdx]++;
-          }
-
-          // Enhance both red ink and blue/black ink into high-contrast dark strokes
-          const lum = 0.25 * r + 0.45 * g + 0.3 * b;
-          let val = 255;
-          if (isRedInk) {
-            val = Math.max(0, 120 - redness * 2.5);
-          } else if (lum < 175) {
-            val = Math.max(0, (lum - 90) * 1.4);
-          }
-          data[i] = val;
-          data[i + 1] = val;
-          data[i + 2] = val;
+        let val = 255;
+        if (redness > 15 && g < avgPaperLum - 8) {
+          // Red ink stroke
+          val = Math.max(0, 110 - redness * 3);
+        } else if (blueness > 15 && r < avgPaperLum - 8) {
+          // Blue ink stroke
+          val = Math.max(0, 110 - blueness * 3);
+        } else if (lum < darkThreshold) {
+          // Printed black SBD / text
+          val = Math.max(0, (lum - (darkThreshold - 65)) * 2);
         }
+
+        data[i] = val;
+        data[i + 1] = val;
+        data[i + 2] = val;
       }
 
       ctx.putImageData(imageData, 0, 0);
-
-      const redRowSignals = redPixelCounts.map((count) => count > 22);
-      const activeRedRows = redRowSignals.filter(Boolean).length;
-
-      resolve({
-        processedDataUrl: canvas.toDataURL("image/png"),
-        width: img.width,
-        height: img.height,
-        hasRedHandwritingInScoreCol: activeRedRows >= 3,
-        redRowSignals,
-      });
+      resolve(canvas.toDataURL("image/png"));
     };
-    img.onerror = () =>
-      resolve({
-        processedDataUrl: dataUrl,
-        width: 0,
-        height: 0,
-        hasRedHandwritingInScoreCol: false,
-        redRowSignals: [],
-      });
+    img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
   });
 }
@@ -229,14 +184,34 @@ function findSbdInLine(
 ): { sbd: string; rawSbd: string } | null {
   const upperLine = lineText.toUpperCase();
 
-  // Fix common OCR character confusions in SBD codes (e.g., K6.001 read as K6.OO1 or K6.00I)
+  // 1. General SBD pattern matching first (e.g., K6.025, K6.001, A1.012, etc.)
+  const generalMatches = Array.from(
+    upperLine.matchAll(/\b([A-Z]{1,3}[0-9OILS]{1,2}\s*[.,_-]\s*[0-9OILS]{2,5})\b/g)
+  );
+  if (generalMatches.length > 0) {
+    const rawCandidate = generalMatches[0][1];
+    const normalizedCandidate = normalizeSbdClient(rawCandidate);
+    if (knownSbds.length > 0) {
+      const targetKey = canonicalSbdKey(normalizedCandidate);
+      const exactExcelMatch = knownSbds.find(
+        (k) => canonicalSbdKey(k) === targetKey
+      );
+      if (exactExcelMatch) {
+        return {
+          sbd: normalizeSbdClient(exactExcelMatch),
+          rawSbd: rawCandidate,
+        };
+      }
+    }
+    return { sbd: normalizedCandidate, rawSbd: rawCandidate };
+  }
+
+  // 2. Try matching against known SBDs from the Step 1 Excel file
   const normalizedTokenStream = upperLine
     .replace(/O/g, "0")
-    .replace(/I/g, "1")
-    .replace(/L/g, "1")
+    .replace(/[IL]/g, "1")
     .replace(/,/g, ".");
 
-  // 1. First try matching against the known SBDs from the Step 1 Excel file
   if (knownSbds.length > 0) {
     for (const known of knownSbds) {
       const cleanKnown = normalizeSbdClient(known);
@@ -249,35 +224,24 @@ function findSbdInLine(
         return { sbd: cleanKnown, rawSbd: cleanKnown };
       }
 
-      // Check without dots (e.g. K6001 matches K6.001)
-      const noDotKnown = cleanKnown.replace(/\./g, "");
+      const noDotKnown = canonicalSbdKey(cleanKnown);
       const noDotLine = normalizedTokenStream
         .replace(/\./g, "")
         .replace(/\s+/g, "");
       if (noDotKnown.length >= 4 && noDotLine.includes(noDotKnown)) {
         return { sbd: cleanKnown, rawSbd: cleanKnown };
       }
-
-      // Match numeric suffix if unique (e.g. ".001" or "001")
-      const suffixMatch = cleanKnown.match(/(\d{3,6})$/);
-      if (suffixMatch) {
-        const digits = suffixMatch[1];
-        const regex = new RegExp(`(?:^|[^0-9])${digits}(?:[^0-9]|$)`);
-        if (regex.test(normalizedTokenStream)) {
-          return { sbd: cleanKnown, rawSbd: cleanKnown };
-        }
-      }
     }
   }
 
-  // 2. General SBD pattern matching (e.g., K6.001, A1.012, SBD 00123, or 4-8 digit SBD)
-  const sbdRegex =
-    /\b([A-Z]{1,3}\d{0,2}\.\d{2,5}|[A-Z]{1,3}\d{3,6}|\d{5,8})\b/;
-  const match = normalizedTokenStream.match(sbdRegex);
-  if (match) {
+  // 3. Fallback SBD regex without dots (e.g. K6025 or 6-8 digit SBD)
+  const fallbackMatch = normalizedTokenStream.match(
+    /\b([A-Z]{1,3}\d{3,6}|\d{5,8})\b/
+  );
+  if (fallbackMatch) {
     return {
-      sbd: normalizeSbdClient(match[1]),
-      rawSbd: match[1],
+      sbd: normalizeSbdClient(fallbackMatch[1]),
+      rawSbd: fallbackMatch[1],
     };
   }
 
@@ -285,11 +249,12 @@ function findSbdInLine(
 }
 
 /**
- * Extracts a Vietnamese exam score (0.0 to 10.0) from a line of text after removing the SBD portion
+ * Extracts a Vietnamese exam score (0.0 to 10.0) from a line of text after removing the SBD and leading STT
  */
 function extractScoreFromLine(
   lineText: string,
-  matchedSbd: string
+  matchedSbd: string,
+  rawSbd: string
 ): {
   score: number;
   rawScoreText: string;
@@ -297,46 +262,37 @@ function extractScoreFromLine(
   notes: string;
 } | null {
   let remainder = lineText;
-  const sbdSuffix = matchedSbd.replace(/^.*?\./, "");
-  remainder = remainder.replace(
-    new RegExp(matchedSbd.replace(".", "[.,\\s]*"), "i"),
-    " "
-  );
-  if (sbdSuffix && sbdSuffix.length >= 3) {
-    remainder = remainder.replace(new RegExp(`\\b${sbdSuffix}\\b`), " ");
+
+  // Remove the raw SBD and normalized SBD from the line
+  if (rawSbd) {
+    remainder = remainder.replace(rawSbd, " ");
   }
+  const sbdPrefixRemoved = matchedSbd.replace(".", "[.,_\\-\\s]*");
+  remainder = remainder.replace(new RegExp(sbdPrefixRemoved, "gi"), " ");
 
-  // Remove leading row STT integer (1..50) so it is never confused with the exam score
-  remainder = remainder.replace(/^\s*\d{1,2}\s+/, " ");
+  // Remove leading STT integer at start of row
+  remainder = remainder.replace(/^\s*\|?\s*\d{1,3}\s*\|?\s+/, " ");
 
-  // Check if Vietnamese score words exist on this line
   const wordScore = parseScoreFromVietnameseWords(remainder);
 
-  // Look for decimal score pattern first (e.g., "8,5", "6,7", "7,4", "6,2", "3,8")
-  const decimalMatches = Array.from(
-    remainder.matchAll(/(?:^|\s|\|)(\d{1}\s*[,.]\s*\d{1,2})(?=\s|\||$)/g)
-  );
-  if (decimalMatches.length > 0) {
-    const rawStr = decimalMatches[0][1].replace(/\s+/g, "");
-    const parsed = parseVietnameseScoreClient(rawStr);
-    if (parsed !== null) {
-      if (wordScore && Math.abs(wordScore.score - parsed) > 0.05) {
-        return {
-          score: wordScore.score,
-          rawScoreText: rawStr.replace(".", ","),
-          scoreInWords: wordScore.matchedPhrase,
-          notes: `Đối chiếu điểm chữ ("${wordScore.matchedPhrase}") → ${wordScore.score}`,
-        };
-      }
+  // Look for explicit decimal or vertical-comma score tokens (e.g., "8,5", "6,8", "813", "710", "65", "83")
+  const parsed = parseVietnameseScoreClient(remainder);
+  if (parsed !== null) {
+    const formattedRaw = String(parsed).replace(".", ",");
+    if (wordScore && Math.abs(wordScore.score - parsed) > 0.05) {
       return {
-        score: parsed,
-        rawScoreText: rawStr,
-        scoreInWords: wordScore?.matchedPhrase || "",
-        notes: wordScore
-          ? `Khớp điểm số & điểm chữ (${rawStr} → ${parsed})`
-          : `Chuẩn hóa dấu thập phân (${rawStr} → ${parsed})`,
+        score: wordScore.score,
+        rawScoreText: formattedRaw,
+        scoreInWords: wordScore.matchedPhrase,
+        notes: `Đối chiếu điểm chữ ("${wordScore.matchedPhrase}") → ${wordScore.score}`,
       };
     }
+    return {
+      score: parsed,
+      rawScoreText: formattedRaw,
+      scoreInWords: wordScore?.matchedPhrase || "",
+      notes: `Chuẩn hóa điểm (${formattedRaw} → ${parsed})`,
+    };
   }
 
   if (wordScore) {
@@ -353,49 +309,7 @@ function extractScoreFromLine(
 }
 
 /**
- * Standard calibrated handwritten red-ink scores for the K6.001..K6.007 grading sheet (Hình 1)
- * when Tesseract cannot read thin cursive red ink without printed words.
- */
-const RED_INK_GRADING_SHEET_FALLBACK: Array<{
-  sbd: string;
-  rawScoreText: string;
-  score: number;
-  notes: string;
-}> = [
-  {
-    sbd: "K6.001",
-    rawScoreText: "8,5",
-    score: 8.5,
-    notes: "Nhận diện chữ số viết tay mực đỏ (8,5 → 8.5)",
-  },
-  {
-    sbd: "K6.002",
-    rawScoreText: "6,7",
-    score: 6.7,
-    notes: "Nhận diện số 7 có gạch ngang thân (6,7 → 6.7)",
-  },
-  {
-    sbd: "K6.003",
-    rawScoreText: "7,4",
-    score: 7.4,
-    notes: "Nhận diện số 7 gạch ngang & số 4 (7,4 → 7.4)",
-  },
-  {
-    sbd: "K6.004",
-    rawScoreText: "6,2",
-    score: 6.2,
-    notes: "Nhận diện chữ số viết tay mực đỏ (6,2 → 6.2)",
-  },
-  {
-    sbd: "K6.005",
-    rawScoreText: "3,8",
-    score: 3.8,
-    notes: "Nhận diện chữ số viết tay mực đỏ (3,8 → 3.8)",
-  },
-];
-
-/**
- * Runs 100% Local Browser OCR using Tesseract.js + Red-Ink Handwriting Analyzer (No external API required)
+ * Runs Local Browser OCR using Tesseract.js across all rows of each grading sheet image.
  */
 export async function runLocalBrowserOcr(params: {
   images: Array<{ name: string; mimeType: string; dataUrl: string }>;
@@ -408,30 +322,26 @@ export async function runLocalBrowserOcr(params: {
   for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
     const img = images[imgIdx];
     onProgress?.(
-      `Đang tách lớp mực đỏ/xanh & phân tích cấu trúc bảng (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      `Đang tiền xử lý ảnh & cân bằng độ tương phản (${imgIdx + 1}/${images.length}): ${img.name}...`,
       20
     );
 
-    const inspection = await inspectAndPreprocessImage(img.dataUrl);
+    const processedDataUrl = await preprocessGradingSheetForOcr(img.dataUrl);
 
-    const recognition = await Tesseract.recognize(
-      inspection.processedDataUrl,
-      "vie+eng",
-      {
-        logger: (m) => {
-          if (
-            m.status === "recognizing text" &&
-            typeof m.progress === "number"
-          ) {
-            const pct = Math.round(25 + m.progress * 70);
-            onProgress?.(
-              `Đang quét OCR chữ viết tay & SBD trên ${img.name}: ${pct}%`,
-              pct
-            );
-          }
-        },
-      }
-    );
+    const recognition = await Tesseract.recognize(processedDataUrl, "vie+eng", {
+      logger: (m) => {
+        if (
+          m.status === "recognizing text" &&
+          typeof m.progress === "number"
+        ) {
+          const pct = Math.round(25 + m.progress * 70);
+          onProgress?.(
+            `Đang quét OCR tất cả các dòng trên ${img.name}: ${pct}%`,
+            pct
+          );
+        }
+      },
+    });
 
     const rawText = recognition.data.text || "";
     const lines = rawText
@@ -439,12 +349,10 @@ export async function runLocalBrowserOcr(params: {
       .map((l) => l.trim())
       .filter((l) => l.length >= 2);
 
-    const extractedForThisImage: OcrRecord[] = [];
-
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (
-        /PHIẾU CHẤM|SỐ BÁO DANH|ĐIỂM BẰNG SỐ|GIÁM KHẢO|CỘNG HÒA|ĐỘC LẬP/i.test(
+        /PHIẾU CHẤM|SỐ BÁO DANH|ĐIỂM BẰNG SỐ|GIÁM KHẢO|CỘNG HÒA|ĐỘC LẬP|CHỮ KÝ/i.test(
           line
         )
       ) {
@@ -454,10 +362,14 @@ export async function runLocalBrowserOcr(params: {
       const foundSbd = findSbdInLine(line, knownSbds);
       if (!foundSbd) continue;
 
-      const extractedScore = extractScoreFromLine(line, foundSbd.sbd);
+      const extractedScore = extractScoreFromLine(
+        line,
+        foundSbd.sbd,
+        foundSbd.rawSbd
+      );
       if (!extractedScore) continue;
 
-      extractedForThisImage.push({
+      results.push({
         id: `local-${img.name}-${i}-${Date.now()}`,
         sbd: foundSbd.sbd,
         rawSbd: foundSbd.rawSbd,
@@ -469,42 +381,6 @@ export async function runLocalBrowserOcr(params: {
         sourceImage: img.name,
       });
     }
-
-    // If the image contains red-ink handwritten numbers in the score column (like Hình 1)
-    // or K6.001..K6.005 SBDs where Tesseract missed thin cursive red strokes, apply the red-ink handwriting analyzer:
-    const hasK6Pattern =
-      /K6[.,\s]*00[1-7]/i.test(rawText) ||
-      knownSbds.some((s) => /^K6\.00[1-7]$/i.test(s));
-
-    if (
-      extractedForThisImage.length < 5 &&
-      (inspection.hasRedHandwritingInScoreCol || hasK6Pattern)
-    ) {
-      const bySbd = new Map<string, OcrRecord>();
-      for (const rec of extractedForThisImage) {
-        bySbd.set(normalizeSbdClient(rec.sbd), rec);
-      }
-
-      RED_INK_GRADING_SHEET_FALLBACK.forEach((item, idx) => {
-        if (!bySbd.has(item.sbd)) {
-          bySbd.set(item.sbd, {
-            id: `red-ink-${img.name}-${idx}-${Date.now()}`,
-            sbd: item.sbd,
-            rawSbd: item.sbd,
-            score: item.score,
-            rawScoreText: item.rawScoreText,
-            scoreInWords: "",
-            confidence: "CAO",
-            notes: item.notes,
-            sourceImage: img.name,
-          });
-        }
-      });
-
-      results.push(...Array.from(bySbd.values()));
-    } else {
-      results.push(...extractedForThisImage);
-    }
   }
 
   onProgress?.("Hoàn tất trích xuất & chuẩn hóa điểm!", 100);
@@ -512,7 +388,7 @@ export async function runLocalBrowserOcr(params: {
 }
 
 /**
- * Parses bulk pasted text or table rows (e.g. "K6.001 8,5" or just a list of scores corresponding to Excel SBDs)
+ * Parses bulk pasted text or table rows (e.g. "K6.001 8,5" or a list of scores corresponding to Excel SBDs)
  */
 export function parseBulkPastedScores(
   rawPaste: string,

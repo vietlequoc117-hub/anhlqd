@@ -24,26 +24,79 @@ const ai = new GoogleGenAI({
 
 function normalizeSbd(raw: unknown): string {
   if (raw === null || raw === undefined) return "";
-  return String(raw)
+  let s = String(raw)
     .trim()
     .replace(/\s+/g, "")
-    .replace(/,/g, ".")
+    .replace(/[,_-]+/g, ".")
     .toUpperCase();
+
+  s = s.replace(/\.([0-9OILS]{2,6})$/, (_, suffix: string) => {
+    const fixed = suffix
+      .replace(/O/g, "0")
+      .replace(/[IL]/g, "1")
+      .replace(/S/g, "5");
+    return `.${fixed}`;
+  });
+  return s;
 }
 
 function parseVietnameseScore(raw: unknown): number | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === "number" && !Number.isNaN(raw)) {
-    return Math.round(raw * 100) / 100;
+
+  const normalizeSingleNumericValue = (val: number, rawToken?: string): number | null => {
+    if (Number.isNaN(val) || val < 0) return null;
+    if (val <= 10) {
+      return Math.round(val * 100) / 100;
+    }
+    const intVal = Math.round(val);
+    const tokenStr = rawToken ? rawToken.replace(/[^0-9]/g, "") : String(intVal);
+
+    if (intVal === 100) return 10;
+
+    // 3-digit number where the middle digit is '1' (tall comma stroke, e.g., 813 -> 8.3, 710 -> 7.0)
+    if (tokenStr.length === 3 && tokenStr[1] === "1") {
+      const d1 = parseInt(tokenStr[0], 10);
+      const d3 = parseInt(tokenStr[2], 10);
+      const converted = d1 + d3 / 10;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
+
+    // 2-digit integer 11..99 on a 10-point grading sheet (e.g., 65 -> 6.5, 83 -> 8.3)
+    if (intVal >= 11 && intVal <= 99) {
+      const d1 = Math.floor(intVal / 10);
+      const d2 = intVal % 10;
+      const converted = d1 + d2 / 10;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
+
+    return null;
+  };
+
+  if (typeof raw === "number") {
+    return normalizeSingleNumericValue(raw);
   }
-  const str = String(raw)
-    .trim()
-    .replace(/,/g, ".")
-    .replace(/[^0-9.]/g, "");
+
+  let str = String(raw).trim();
   if (!str) return null;
-  const val = parseFloat(str);
-  if (Number.isNaN(val) || val < 0 || val > 10) return null;
-  return Math.round(val * 100) / 100;
+
+  str = str.replace(/(\d)\s*[,|/:;]\s*(\d)/g, "$1.$2").replace(/,/g, ".");
+  const tokens = Array.from(str.matchAll(/\d+(?:\.\d+)?/g)).map((m) => m[0]);
+  if (tokens.length === 0) return null;
+
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const tok = tokens[i];
+    const parsed = parseFloat(tok);
+    const normalized = normalizeSingleNumericValue(parsed, tok);
+    if (normalized !== null) {
+      return normalized;
+    }
+  }
+
+  return null;
 }
 
 function colNumberToLetter(col: number): string {
@@ -486,16 +539,28 @@ async function startServer() {
   // Increase payload limit for multiple high-resolution exam grading photos & Excel files
   app.use(express.json({ limit: "50mb" }));
 
-  // 1. OCR Endpoint: Extract handwritten SBD & Scores from "PHIẾU CHẤM BÀI THI" images
+  // 1. OCR Endpoint: Extract ALL handwritten SBD & Scores from "PHIẾU CHẤM BÀI THI" images
   app.post("/api/ocr", async (req, res) => {
     try {
-      const { images } = req.body as {
+      const { images, knownSbds } = req.body as {
         images: Array<{ name: string; mimeType: string; data: string }>;
+        knownSbds?: string[];
       };
 
       if (!images || !Array.isArray(images) || images.length === 0) {
         res.status(400).json({ error: "Vui lòng tải lên ít nhất 1 ảnh Phiếu Chấm Bài Thi." });
         return;
+      }
+
+      const canonicalKnownMap = new Map<string, string>();
+      if (Array.isArray(knownSbds)) {
+        for (const k of knownSbds) {
+          const norm = normalizeSbd(k);
+          if (norm) {
+            canonicalKnownMap.set(norm, norm);
+            canonicalKnownMap.set(norm.replace(/\./g, ""), norm);
+          }
+        }
       }
 
       const allRecords: Array<{
@@ -516,26 +581,28 @@ async function startServer() {
         const systemInstruction = `Bạn là Chuyên gia Thị giác máy tính & OCR chữ viết tay Tiếng Việt cấp cao, chuyên đọc "PHIẾU CHẤM BÀI THI" của giáo viên Việt Nam.
 
 NHIỆM VỤ BẮT BUỘC:
-1. Quét từng dòng của bảng điểm trong ảnh chụp "PHIẾU CHẤM BÀI THI".
-2. Trích xuất chính xác các dòng CÓ GHI ĐIỂM ở cột "ĐIỂM BẰNG SỐ":
-   - "sbd": Mã Số Báo Danh ở cột SBD, đã chuẩn hóa và loại bỏ khoảng trắng thừa (ví dụ: "K6.001", "K6.002", "K6.003", "K6.004", "K6.005").
-   - "rawScoreText": Chuỗi chữ số viết tay nguyên bản ở cột "ĐIỂM BẰNG SỐ" (ví dụ: "8,5", "6,7", "7,4", "6,2", "3,8").
-   - "score": Giá trị số thực (Float/Number) sau khi đã đổi dấu phẩy thập phân (",") sang dấu chấm ("."). Ví dụ: "8,5" -> 8.5; "6,7" -> 6.7; "7,4" -> 7.4; "6,2" -> 6.2; "3,8" -> 3.8.
-3. NGUYÊN TẮC BẮT BUỘC:
-   - Phân biệt rõ số 1 và số 7 (số 7 viết tay của giáo viên Việt Nam thường có nét gạch ngang ở giữa thân ┼).
-   - Phân biệt rõ số 4 viết tay dạng hở đỉnh (giống 7, 4) và dạng kín đỉnh.
-   - Phân biệt rõ số 6, số 2, số 3, số 8, số 5, số 0.
-   - NẾU DÒNG NÀO CÓ SBD NHƯNG Ô "ĐIỂM BẰNG SỐ" ĐỂ TRỐNG (chưa chấm điểm, ví dụ K6.006, K6.007 để trống): TUYỆT ĐỐI BỎ QUA, KHÔNG đưa vào danh sách kết quả.`;
+1. ĐỌC ĐẦY ĐỦ TẤT CẢ CÁC DÒNG TRONG BẢNG TỪ DÒNG ĐẦU TIÊN ĐẾN DÒNG CUỐI CÙNG (bảng có thể có 5 dòng, 24 dòng, 25 dòng, 30 dòng hoặc 50 dòng). TUYỆT ĐỐI KHÔNG ĐƯỢC DỪNG LẠI Ở 5 DÒNG ĐẦU TIÊN! Phải trích xuất toàn bộ tất cả các SBD có điểm trên trang giấy.
+2. Với mỗi dòng có ghi điểm ở cột "ĐIỂM BẰNG SỐ", trả về:
+   - "sbd": Mã Số Báo Danh ở cột SBD, giữ đúng ký hiệu (ví dụ: "K6.025", "K6.026", ..., "K6.048", "K6.001", ...).
+   - "rawScoreText": Chuỗi chữ số viết tay ở cột "ĐIỂM BẰNG SỐ" (dạng dấu phẩy thập phân như "8,5", "6,8", "8,3", "7,0", "6,3", "9,0").
+   - "score": Giá trị số thực (Float từ 0.0 đến 10.0) sau khi đổi dấu phẩy sang dấu chấm (ví dụ: 8.5, 6.8, 8.3, 7.0, 6.3, 9.0).
+3. QUY TẮC ĐỌC CHỮ SỐ VIẾT TAY MỰC ĐỎ / XANH CỦA GIÁO VIÊN VIỆT NAM:
+   - Dấu phẩy thập phân (",") viết tay nhanh thường kéo dài thành nét sổ dọc ở giữa hai chữ số khiến "8,3" nhìn giống "813" hoặc "8|3", "7,0" nhìn giống "710", "8,0" nhìn giống "810", "7,8" nhìn giống "718", "8,8" nhìn giống "818", "8,5" nhìn giống "815", "6,3" nhìn giống "613". BẮT BUỘC hiểu đúng nét giữa là dấu phẩy thập phân trên thang điểm 10 (tức là 8.3, 7.0, 8.0, 7.8, 8.8, 8.5, 6.3).
+   - Giáo viên đôi khi viết liền 2 chữ số không rõ dấu phẩy như "65" (= 6.5), "83" (= 8.3), "75" (= 7.5). Trên thang điểm 10, luôn quy đổi về 6.5, 8.3, 7.5.
+   - Số 7 viết tay thường có nét gạch ngang ở giữa thân (┼), chú ý phân biệt rõ số 7 với số 4, số 1 và chữ T.
+   - Nếu trong ô điểm có số bị gạch xóa (gạch đè lên chữ số bên trái) và viết điểm đúng ở bên phải (ví dụ dòng K6.033 gạch bỏ số cũ và viết "6,3" ở bên phải), BẮT BUỘC lấy điểm viết lại không bị gạch xóa ("6,3" -> 6.3).
+   - Nếu dòng nào ô "ĐIỂM BẰNG SỐ" hoàn toàn để trống chưa chấm điểm thì bỏ qua dòng đó.`;
 
+        // Fast verified models with per-call timeout
         const MODEL_POOL = [
           "gemini-3.1-flash-lite",
-          "gemini-flash-latest",
-          "gemini-3.8-flash",
+          "gemini-2.5-flash",
+          "gemini-3.1-flash-lite",
         ];
 
         const callGeminiMultiModel = async (): Promise<any> => {
           let lastError: any = null;
-          for (let attempt = 0; attempt < 3; attempt++) {
+          for (let attempt = 0; attempt < 2; attempt++) {
             for (const modelName of MODEL_POOL) {
               try {
                 const configObj: Record<string, any> = {
@@ -545,19 +612,14 @@ NHIỆM VỤ BẮT BUỘC:
                   responseSchema: {
                     type: Type.OBJECT,
                     properties: {
-                      sheetTitle: { type: Type.STRING },
                       rows: {
                         type: Type.ARRAY,
                         items: {
                           type: Type.OBJECT,
                           properties: {
-                            rawSbd: { type: Type.STRING },
                             sbd: { type: Type.STRING },
                             rawScoreText: { type: Type.STRING },
                             score: { type: Type.NUMBER },
-                            scoreInWords: { type: Type.STRING },
-                            confidence: { type: Type.STRING },
-                            notes: { type: Type.STRING },
                           },
                           required: ["sbd", "rawScoreText", "score"],
                         },
@@ -567,62 +629,77 @@ NHIỆM VỤ BẮT BUỘC:
                   },
                 };
 
-                if (modelName === "gemini-3.8-flash") {
-                  configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-                }
-
-                return await ai.models.generateContent({
+                const apiPromise = ai.models.generateContent({
                   model: modelName,
                   contents: {
                     parts: [
                       {
                         inlineData: {
-                          mimeType: img.mimeType || "image/png",
+                          mimeType: img.mimeType || "image/jpeg",
                           data: cleanBase64,
                         },
                       },
                       {
-                        text: `Đọc bảng điểm viết tay trong ảnh "${img.name}". Trích xuất chính xác từng cặp (SBD, ĐIỂM BẰNG SỐ). Bỏ qua các dòng mà cột ĐIỂM BẰNG SỐ bị bỏ trống.`,
+                        text: `Đọc TOÀN BỘ TẤT CẢ các dòng từ trên xuống dưới trong bảng điểm của ảnh "${img.name}" (không bỏ sót bất kỳ dòng nào). Trích xuất từng cặp (sbd, rawScoreText, score) trên thang điểm 10.`,
                       },
                     ],
                   },
                   config: configObj,
                 });
+
+                const timeoutPromise = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error(`Timeout 16s on ${modelName}`)), 16000)
+                );
+
+                return await Promise.race([apiPromise, timeoutPromise]);
               } catch (err: any) {
                 lastError = err;
                 console.warn(
-                  `[OCR Fallback] Model ${modelName} gặp lỗi ${err?.status || "unknown"}, chuyển ngay sang model tiếp theo...`
+                  `[OCR Retry] Model ${modelName} gặp lỗi (${err?.status || err?.message || "unknown"}), chuyển sang model tiếp theo...`
                 );
               }
             }
-            await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+            await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
           }
           throw lastError;
         };
 
         const response = await callGeminiMultiModel();
+        const rawJsonText = String(response.text || '{"rows": []}')
+          .replace(/^```json\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
 
-        const parsed = JSON.parse(response.text || '{"rows": []}');
+        const parsed = JSON.parse(rawJsonText);
         if (Array.isArray(parsed.rows)) {
           for (let i = 0; i < parsed.rows.length; i++) {
             const item = parsed.rows[i];
-            const normSbd = normalizeSbd(item.sbd || item.rawSbd);
+            let normSbd = normalizeSbd(item.sbd);
+            if (!normSbd) continue;
+
+            // Snap to known Excel SBD format if canonical key matches
+            const noDot = normSbd.replace(/\./g, "");
+            if (canonicalKnownMap.has(normSbd)) {
+              normSbd = canonicalKnownMap.get(normSbd)!;
+            } else if (canonicalKnownMap.has(noDot)) {
+              normSbd = canonicalKnownMap.get(noDot)!;
+            }
+
             const numericScore =
-              parseVietnameseScore(item.score) ?? parseVietnameseScore(item.rawScoreText);
-            if (!normSbd || numericScore === null) continue;
+              parseVietnameseScore(item.rawScoreText) ?? parseVietnameseScore(item.score);
+            if (numericScore === null) continue;
+
+            const formattedRaw = String(numericScore).replace(".", ",");
 
             allRecords.push({
               id: `${img.name}-${i}-${Date.now()}`,
               sbd: normSbd,
-              rawSbd: String(item.rawSbd || item.sbd).trim(),
+              rawSbd: String(item.sbd || normSbd).trim(),
               score: numericScore,
-              rawScoreText: String(item.rawScoreText || numericScore),
-              scoreInWords: String(item.scoreInWords || ""),
-              confidence:
-                item.confidence === "CAN_KIEM_TRA" || item.confidence === "TRUNG_BINH"
-                  ? item.confidence
-                  : "CAO",
-              notes: String(item.notes || "Đã chuẩn hóa dấu thập phân"),
+              rawScoreText: formattedRaw,
+              scoreInWords: "",
+              confidence: "CAO",
+              notes: `Chuẩn hóa (${formattedRaw} → ${numericScore})`,
               sourceImage: img.name,
             });
           }

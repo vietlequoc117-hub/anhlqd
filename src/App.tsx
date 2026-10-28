@@ -27,6 +27,7 @@ import {
   OcrRecord,
   ExcelSheetData,
   normalizeSbdClient,
+  canonicalSbdKey,
   parseVietnameseScoreClient,
   generateSampleGradingSheetImage,
 } from "./utils/sampleGradingSheet";
@@ -153,12 +154,14 @@ export default function App() {
       .filter(Boolean);
   }, [excelData, sbdCol]);
 
-  // Lookup map for fast VLOOKUP matching
+  // Lookup map for fast VLOOKUP matching (indexes both normalized and dotless canonical keys)
   const ocrLookupMap = useMemo(() => {
     const map = new Map<string, OcrRecord>();
     for (const rec of ocrRecords) {
       const norm = normalizeSbdClient(rec.sbd);
+      const canon = canonicalSbdKey(rec.sbd);
       if (norm) map.set(norm, rec);
+      if (canon) map.set(canon, rec);
     }
     return map;
   }, [ocrRecords]);
@@ -169,7 +172,10 @@ export default function App() {
     return excelData.studentRows.map((row) => {
       const rawSbd = row.cells[sbdCol] ?? row.sbd;
       const normSbd = normalizeSbdClient(rawSbd);
-      const matchedOcr = normSbd ? ocrLookupMap.get(normSbd) : undefined;
+      const canonSbd = canonicalSbdKey(rawSbd);
+      const matchedOcr =
+        (normSbd ? ocrLookupMap.get(normSbd) : undefined) ||
+        (canonSbd ? ocrLookupMap.get(canonSbd) : undefined);
       return {
         ...row,
         displaySbd: rawSbd !== null && rawSbd !== undefined ? String(rawSbd) : "",
@@ -433,8 +439,13 @@ if __name__ == "__main__":
       const combined = append ? [...prev, ...incoming] : incoming;
       const bySbd = new Map<string, OcrRecord>();
       for (const item of combined) {
-        const key = normalizeSbdClient(item.sbd);
-        if (key) bySbd.set(key, item);
+        const key = canonicalSbdKey(item.sbd) || normalizeSbdClient(item.sbd);
+        if (key) {
+          bySbd.set(key, {
+            ...item,
+            sbd: normalizeSbdClient(item.sbd),
+          });
+        }
       }
       const nextList = Array.from(bySbd.values());
 
@@ -513,33 +524,48 @@ if __name__ == "__main__":
             },
           });
         } else {
-          // HYBRID_CLOUD: Call /api/ocr per single compressed image with automatic fallback to Local OCR
-          try {
-            const response = await fetch("/api/ocr", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                images: [
-                  {
-                    name: currentImg.name,
-                    mimeType: currentImg.mimeType,
-                    data: currentImg.dataUrl,
-                  },
-                ],
-              }),
-            });
+          // HYBRID_CLOUD: Call /api/ocr per single compressed image with up to 3 retries before Local OCR fallback
+          let cloudSuccess = false;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              const response = await fetch("/api/ocr", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  knownSbds: activeKnownSbds,
+                  images: [
+                    {
+                      name: currentImg.name,
+                      mimeType: currentImg.mimeType,
+                      data: currentImg.dataUrl,
+                    },
+                  ],
+                }),
+              });
 
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status}`);
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+              }
+              const data = await response.json();
+              if (Array.isArray(data.records) && data.records.length > 0) {
+                sheetRecords = data.records;
+                cloudSuccess = true;
+                break;
+              } else {
+                throw new Error("Empty cloud records");
+              }
+            } catch {
+              if (attempt < 3) {
+                setOcrProgressText(
+                  `[Phiếu ${idx + 1}/${totalFiles}] Đang thử lại kết nối AI OCR (lần ${attempt + 1}/3)...`
+                );
+                await new Promise((r) => setTimeout(r, 700 * attempt));
+              }
             }
-            const data = await response.json();
-            if (Array.isArray(data.records) && data.records.length > 0) {
-              sheetRecords = data.records;
-            } else {
-              throw new Error("Empty cloud records");
-            }
-          } catch {
-            // Automatic per-image fallback to Local Browser OCR if cloud is busy or offline
+          }
+
+          if (!cloudSuccess) {
+            // Automatic per-image fallback to Local Browser OCR if cloud is unreachable
             sheetRecords = await runLocalBrowserOcr({
               images: [currentImg],
               knownSbds: activeKnownSbds,
@@ -1603,17 +1629,36 @@ if __name__ == "__main__":
 
                 {/* Excel Sheet Title Header Reproduction (Rows 1-4) */}
                 <div className="px-5 py-3 bg-white border-b border-slate-200 text-xs font-serif text-slate-900">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
-                    <div>
-                      <div className="text-[13px] tracking-tight">
-                        SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH
-                      </div>
-                      <div className="text-[13px] font-bold pl-8">TRƯỜNG THCS MỸ XÁ</div>
+                  {excelData.titleRows && excelData.titleRows.length > 0 ? (
+                    <div className="space-y-0.5">
+                      {excelData.titleRows.map((tr) => (
+                        <div
+                          key={tr.rowNumber}
+                          className={
+                            tr.rowNumber >= 3
+                              ? "text-center font-bold text-sm mt-1"
+                              : "text-[13px] font-semibold tracking-tight"
+                          }
+                        >
+                          {tr.texts.join(" — ")}
+                        </div>
+                      ))}
                     </div>
-                  </div>
-                  <div className="text-center font-bold text-sm mt-1">
-                    BẢNG ĐIỂM THI MÔN: VĂN 6
-                  </div>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                        <div>
+                          <div className="text-[13px] tracking-tight">
+                            SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH
+                          </div>
+                          <div className="text-[13px] font-bold pl-8">TRƯỜNG THCS MỸ XÁ</div>
+                        </div>
+                      </div>
+                      <div className="text-center font-bold text-sm mt-1">
+                        BẢNG ĐIỂM THI
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* Matched Excel Table (Exact Hình 3 Layout) */}

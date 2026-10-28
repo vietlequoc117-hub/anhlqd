@@ -4,6 +4,7 @@ import {
   ExcelHeaderCol,
   ExcelStudentRow,
   normalizeSbdClient,
+  canonicalSbdKey,
   parseVietnameseScoreClient,
 } from "./sampleGradingSheet";
 
@@ -301,9 +302,11 @@ export async function exportUpdatedExcelClientSide(params: {
   const ocrMap: Record<string, number> = {};
   for (const rec of ocrRecords || []) {
     const norm = normalizeSbdClient(rec.sbd);
+    const canon = canonicalSbdKey(rec.sbd);
     const val = parseVietnameseScoreClient(rec.score);
-    if (norm && val !== null) {
-      ocrMap[norm] = val;
+    if (val !== null) {
+      if (norm) ocrMap[norm] = val;
+      if (canon) ocrMap[canon] = val;
     }
   }
 
@@ -319,11 +322,20 @@ export async function exportUpdatedExcelClientSide(params: {
     const row = worksheet.getRow(r);
     const rawSbd = extractCellValue(row.getCell(sbdColNum).value);
     const normSbd = normalizeSbdClient(rawSbd);
-    if (!normSbd) continue;
+    const canonSbd = canonicalSbdKey(rawSbd);
+    if (!normSbd && !canonSbd) continue;
 
-    if (Object.prototype.hasOwnProperty.call(ocrMap, normSbd)) {
+    const matchedVal =
+      (normSbd && Object.prototype.hasOwnProperty.call(ocrMap, normSbd)
+        ? ocrMap[normSbd]
+        : undefined) ??
+      (canonSbd && Object.prototype.hasOwnProperty.call(ocrMap, canonSbd)
+        ? ocrMap[canonSbd]
+        : undefined);
+
+    if (matchedVal !== undefined) {
       const scoreCell = row.getCell(scoreColNum);
-      const numericScore = Number(ocrMap[normSbd]);
+      const numericScore = Number(matchedVal);
       // Strictly only mutate .value as Float/Number, preserving all cell styles/borders/fonts
       scoreCell.value = numericScore;
       matchedCount++;
