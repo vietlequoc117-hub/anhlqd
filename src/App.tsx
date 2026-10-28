@@ -97,8 +97,8 @@ async function optimizeImageForBatchOcr(
 type OcrEngineMode = "LOCAL_WASM" | "RAPID_KEYBOARD" | "HYBRID_CLOUD";
 
 export default function App() {
-  // Sequential Step Navigation (1: Excel Nguồn -> 2: Ảnh Phiếu Chấm -> 3: Khớp & Xuất Excel)
-  const [currentStep, setCurrentStep] = useState<1 | 2 | 3>(1);
+  // Sequential Step Navigation (1: Excel Nguồn -> 2: Quét Ảnh & Điền Điểm Excel)
+  const [currentStep, setCurrentStep] = useState<1 | 2>(1);
 
   // STEP 1: Excel Source File State (100% Client-Side Capable)
   const [excelData, setExcelData] = useState<ExcelSheetData | null>(null);
@@ -875,28 +875,13 @@ if __name__ == "__main__":
             <span
               className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono ${
                 ocrRecords.length > 0
-                  ? "bg-blue-600 text-white"
+                  ? "bg-emerald-600 text-white"
                   : "bg-slate-300 text-slate-700"
               }`}
             >
               {ocrRecords.length > 0 ? "✓" : "2"}
             </span>
-            <span>02. Quét Ảnh / Nhập Điểm (Zero-API)</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setCurrentStep(3)}
-            className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
-              currentStep === 3
-                ? "bg-white text-slate-900 shadow-xs"
-                : "text-slate-600 hover:text-slate-900"
-            }`}
-          >
-            <span className="w-4 h-4 rounded-full text-[10px] flex items-center justify-center font-mono bg-slate-300 text-slate-700">
-              3
-            </span>
-            <span>03. Khớp &amp; Xuất File Excel</span>
+            <span>02. Quét Ảnh &amp; Điền Điểm Excel</span>
           </button>
         </div>
 
@@ -1743,279 +1728,64 @@ if __name__ == "__main__":
                 </div>
               </div>
             )}
-          </section>
-        )}
 
-        {/* =====================================================================
-            BƯỚC 3: ĐỐI CHIẾU KHỚP VLOOKUP, XUẤT EXCEL & MÃ PYTHON OPENPYXL
-           ===================================================================== */}
-        {currentStep === 3 && (
-          <section className="space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <h1 className="text-xl font-bold text-slate-900">
-                  03. Đối Chiếu Khớp Điểm &amp; Xuất File Excel Bảo Toàn Định Dạng
-                </h1>
-                <p className="text-xs text-slate-600 mt-1">
-                  Đã khớp{" "}
-                  <strong className="text-emerald-700 font-mono tabular-nums">
-                    {stats.matchedCount}
-                  </strong>{" "}
-                  học sinh.
-                </p>
-              </div>
-            </div>
-
-            {/* Excel Preview Grid with Match Status */}
-            <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-center gap-2 text-xs text-slate-600">
-                  <FileSpreadsheet className="w-4 h-4 text-emerald-700 shrink-0" />
-                  <span className="font-bold text-slate-900">{excelData?.fileName}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>Sheet: {excelData?.sheetName}</span>
-                </div>
-
-                <div className="flex items-center gap-2 shrink-0">
-                  <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
-                    <button
-                      type="button"
-                      onClick={() => setRowFilter("ALL")}
-                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "ALL"
-                          ? "bg-white text-slate-900 shadow-xs"
-                          : "text-slate-600"
-                      }`}
-                    >
-                      Tất cả ({stats.totalExcelStudents})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRowFilter("MATCHED")}
-                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "MATCHED"
-                          ? "bg-white text-emerald-800 shadow-xs"
-                          : "text-slate-600"
-                      }`}
-                    >
-                      Đã khớp ({stats.matchedCount})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRowFilter("UNMATCHED")}
-                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                        rowFilter === "UNMATCHED"
-                          ? "bg-white text-amber-800 shadow-xs"
-                          : "text-slate-600"
-                      }`}
-                    >
-                      Giữ trống ({stats.unmatchedExcelCount})
-                    </button>
+            {/* Excel Export Card Directly In Step 2 */}
+            {excelData && ocrRecords.length > 0 && (
+              <div className="max-w-2xl mx-auto w-full bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      Xuất File Excel Đã Nhập Điểm Hoàn Chỉnh
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Đã điền điểm số thực Float vào cột {scoreCol}, bảo toàn 100% định dạng file nguồn.
+                    </p>
                   </div>
-
-                  <div className="relative">
-                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      placeholder="Tìm tên hoặc SBD..."
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      className="pl-8 pr-3 py-1 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:border-blue-600 w-40"
-                    />
+                  <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
+                    <FileCheck2 className="w-5 h-5" />
                   </div>
                 </div>
-              </div>
 
-              <div className="overflow-x-auto max-h-[420px]">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead className="sticky top-0 z-10 bg-slate-100 border-b border-slate-300">
-                    <tr className="text-[11px] font-mono text-slate-500 bg-slate-200/60 border-b border-slate-300">
-                      <th className="py-1 px-2.5 text-center border-r border-slate-300 w-14">
-                        Hàng
-                      </th>
-                      {excelData?.headers.map((h) => (
-                        <th
-                          key={h.colLetter}
-                          className={`py-1 px-3 text-center border-r border-slate-300 ${
-                            h.colLetter === sbdCol
-                              ? "bg-amber-100 text-amber-900 font-bold"
-                              : h.colLetter === scoreCol
-                              ? "bg-blue-100 text-blue-900 font-bold"
-                              : ""
-                          }`}
-                        >
-                          {h.colLetter}{" "}
-                          {h.colLetter === sbdCol
-                            ? "(Số BD)"
-                            : h.colLetter === scoreCol
-                            ? "(Điểm - Ghi đè)"
-                            : ""}
-                        </th>
-                      ))}
-                      <th className="py-1 px-3 text-left">Trạng thái VLOOKUP</th>
-                    </tr>
-
-                    <tr className="text-xs font-semibold text-slate-800 bg-slate-100">
-                      <th className="py-2 px-2.5 text-center font-mono text-slate-500 border-r border-slate-300">
-                        {headerRow}
-                      </th>
-                      {excelData?.headers.map((h) => (
-                        <th
-                          key={h.colLetter}
-                          className={`py-2 px-3 border-r border-slate-200 whitespace-nowrap ${
-                            h.colLetter === scoreCol
-                              ? "bg-blue-50 text-blue-900 font-bold"
-                              : ""
-                          }`}
-                        >
-                          {h.label}
-                        </th>
-                      ))}
-                      <th className="py-2 px-3 whitespace-nowrap text-slate-600">
-                        Đối chiếu Điểm → Excel
-                      </th>
-                    </tr>
-                  </thead>
-
-                  <tbody className="divide-y divide-slate-200">
-                    {filteredStudentRows.map((row) => (
-                      <tr
-                        key={row.rowNumber}
-                        className={`hover:bg-slate-50 transition-colors ${
-                          row.isMatched ? "" : "bg-slate-50/40"
-                        }`}
-                      >
-                        <td className="py-2 px-2.5 text-center font-mono tabular-nums text-slate-400 bg-slate-50 border-r border-slate-200">
-                          {row.rowNumber}
-                        </td>
-                        {excelData?.headers.map((h) => {
-                          const isScore = h.colLetter === scoreCol;
-                          const isSbd = h.colLetter === sbdCol;
-                          const rawCellVal = row.cells[h.colLetter];
-
-                          if (isScore) {
-                            return (
-                              <td
-                                key={h.colLetter}
-                                className={`py-2 px-3 border-r border-slate-200 font-mono tabular-nums text-right ${
-                                  row.isMatched
-                                    ? "bg-blue-50/60 font-bold text-blue-700"
-                                    : "text-slate-400 italic"
-                                }`}
-                              >
-                                {row.isMatched ? (
-                                  <div className="flex items-center justify-end gap-1.5">
-                                    <span className="text-[11px] font-normal text-slate-400">
-                                      {scoreCol}
-                                      {row.rowNumber}:
-                                    </span>
-                                    <span className="text-sm">{row.matchedScore}</span>
-                                  </div>
-                                ) : (
-                                  <span className="text-[11px] not-italic text-slate-400">
-                                    (Trống)
-                                  </span>
-                                )}
-                              </td>
-                            );
-                          }
-
-                          return (
-                            <td
-                              key={h.colLetter}
-                              className={`py-2 px-3 border-r border-slate-200 ${
-                                isSbd
-                                  ? "font-mono font-bold text-slate-900 bg-amber-50/40 tabular-nums"
-                                  : "text-slate-700"
-                              }`}
-                            >
-                              {rawCellVal !== null && rawCellVal !== undefined
-                                ? String(rawCellVal)
-                                : ""}
-                            </td>
-                          );
-                        })}
-
-                        <td className="py-2 px-3 whitespace-nowrap">
-                          {row.isMatched ? (
-                            <div className="flex items-center gap-1.5 text-xs text-emerald-700 font-medium">
-                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                              <span>Khớp SBD {row.normalizedSbd}</span>
-                              <span aria-hidden="true">·</span>
-                              <span className="font-mono tabular-nums text-slate-600">
-                                "{row.matchedRawText}" → {row.matchedScore}
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-1.5 text-xs text-slate-500">
-                              <span>Chưa có điểm</span>
-                              <span aria-hidden="true">·</span>
-                              <span>Giữ ô trống</span>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Excel Export Card */}
-            <div className="max-w-2xl mx-auto w-full bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="text-base font-bold text-slate-900">
-                    Xuất File Excel Đã Nhập Điểm Hoàn Chỉnh
-                  </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Đã điền điểm số thực Float vào cột {scoreCol}, bảo toàn 100% định dạng file nguồn.
-                  </p>
-                </div>
-                <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
-                  <FileCheck2 className="w-5 h-5" />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3 text-xs border-t border-b border-slate-200 py-3.5 bg-slate-50/60 rounded-lg px-3">
-                <div className="text-center">
-                  <div className="text-slate-500 text-[11px]">Tiêu đề Sở/Trường</div>
-                  <div className="font-mono text-emerald-700 font-bold mt-0.5">
-                    Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
+                <div className="grid grid-cols-3 gap-3 text-xs border-t border-b border-slate-200 py-3.5 bg-slate-50/60 rounded-lg px-3">
+                  <div className="text-center">
+                    <div className="text-slate-500 text-[11px]">Tiêu đề Sở/Trường</div>
+                    <div className="font-mono text-emerald-700 font-bold mt-0.5">
+                      Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
+                    </div>
+                  </div>
+                  <div className="text-center border-x border-slate-200">
+                    <div className="text-slate-500 text-[11px]">Font chữ &amp; Viền kẻ</div>
+                    <div className="font-mono text-slate-900 font-bold mt-0.5">Giữ nguyên 100%</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-slate-500 text-[11px]">Kiểu dữ liệu điểm</div>
+                    <div className="font-mono text-blue-700 font-bold mt-0.5">Số thực (Float)</div>
                   </div>
                 </div>
-                <div className="text-center border-x border-slate-200">
-                  <div className="text-slate-500 text-[11px]">Font chữ &amp; Viền kẻ</div>
-                  <div className="font-mono text-slate-900 font-bold mt-0.5">Giữ nguyên 100%</div>
-                </div>
-                <div className="text-center">
-                  <div className="text-slate-500 text-[11px]">Kiểu dữ liệu điểm</div>
-                  <div className="font-mono text-blue-700 font-bold mt-0.5">Số thực (Float)</div>
-                </div>
+
+                {exportResult && (
+                  <pre className="p-3 bg-slate-900 text-emerald-300 font-mono text-[11px] rounded-lg border border-slate-800 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                    {exportResult.pythonAuditLog}
+                  </pre>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleExecuteAndExport}
+                  disabled={isExporting || !excelData || ocrRecords.length === 0}
+                  className="w-full py-3 px-4 text-sm font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-xs cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>
+                    {isExporting
+                      ? "Đang xuất file Excel..."
+                      : exportResult
+                      ? `Tải Lại ${exportResult.outputFileName}`
+                      : "Tải File Excel Đã Nhập Điểm (.xlsx)"}
+                  </span>
+                </button>
               </div>
-
-              {exportResult && (
-                <pre className="p-3 bg-slate-900 text-emerald-300 font-mono text-[11px] rounded-lg border border-slate-800 overflow-x-auto whitespace-pre-wrap leading-relaxed">
-                  {exportResult.pythonAuditLog}
-                </pre>
-              )}
-
-              <button
-                type="button"
-                onClick={handleExecuteAndExport}
-                disabled={isExporting || !excelData || ocrRecords.length === 0}
-                className="w-full py-3 px-4 text-sm font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-xs cursor-pointer"
-              >
-                <Download className="w-4 h-4" />
-                <span>
-                  {isExporting
-                    ? "Đang xuất file Excel..."
-                    : exportResult
-                    ? `Tải Lại ${exportResult.outputFileName}`
-                    : "Tải File Excel Đã Nhập Điểm (.xlsx)"}
-                </span>
-              </button>
-            </div>
+            )}
           </section>
         )}
       </main>
