@@ -604,6 +604,11 @@ if __name__ == "__main__":
         );
 
         setOcrProgressPct(Math.round(((idx + 1) / totalFiles) * 100));
+
+        // Gentle pause between images in batch to avoid API burst rate limits
+        if (idx < totalFiles - 1) {
+          await new Promise((r) => setTimeout(r, 400));
+        }
       }
 
       setOcrNotice(
