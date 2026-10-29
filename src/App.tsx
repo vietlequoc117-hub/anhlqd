@@ -40,6 +40,7 @@ import {
   runLocalBrowserOcr,
   parseBulkPastedScores,
 } from "./utils/localOcrEngine";
+import { convertPdfFileToImages } from "./utils/pdfToImages";
 
 interface UploadedImage {
   id: string;
@@ -484,6 +485,7 @@ if __name__ == "__main__":
 
     let totalExtractedAcrossBatch = 0;
     const totalFiles = targetImages.length;
+    let missingCloudKeyMessage: string | null = null;
 
     try {
       // Process each image sequentially in a fault-tolerant batch queue (1..13+)
@@ -544,7 +546,21 @@ if __name__ == "__main__":
               });
 
               if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+                let errPayload: any = null;
+                try {
+                  errPayload = await response.json();
+                } catch {
+                  // ignore non-json error body
+                }
+                if (
+                  response.status === 503 &&
+                  errPayload?.errorCode === "MISSING_GEMINI_API_KEY"
+                ) {
+                  missingCloudKeyMessage =
+                    "Lưu ý trên Vercel: Để AI đọc chữ viết tay bút đỏ chính xác 100% như trên Google AI Studio, bạn cần vào Vercel -> Project Settings -> Environment Variables -> Thêm biến GEMINI_API_KEY rồi bấm Redeploy.";
+                  break;
+                }
+                throw new Error(errPayload?.error || `HTTP ${response.status}`);
               }
               const data = await response.json();
               if (Array.isArray(data.records) && data.records.length > 0) {
@@ -606,9 +622,13 @@ if __name__ == "__main__":
         setOcrProgressPct(Math.round(((idx + 1) / totalFiles) * 100));
       }
 
-      setOcrNotice(
-        `Đã quét hoàn tất ${totalFiles} phiếu chấm và trích xuất tổng cộng ${totalExtractedAcrossBatch} dòng điểm.`
-      );
+      if (missingCloudKeyMessage) {
+        setOcrNotice(missingCloudKeyMessage);
+      } else {
+        setOcrNotice(
+          `Đã quét hoàn tất ${totalFiles} phiếu chấm và trích xuất tổng cộng ${totalExtractedAcrossBatch} dòng điểm.`
+        );
+      }
     } catch (err: any) {
       setOcrNotice(
         err?.message ||
@@ -625,18 +645,55 @@ if __name__ == "__main__":
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    setOcrNotice(`Đang nén tối ưu & nạp ${files.length} ảnh phiếu chấm...`);
+    setOcrNotice(`Đang xử lý & nạp ${files.length} tệp phiếu chấm (Ảnh / PDF)...`);
     const newImages: UploadedImage[] = [];
+
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const optimized = await optimizeImageForBatchOcr(file);
-      newImages.push({
-        id: `${file.name}-${Date.now()}-${i}`,
-        name: file.name,
-        mimeType: optimized.mimeType,
-        dataUrl: optimized.dataUrl,
-        status: "PENDING",
-      });
+      const isPdf =
+        file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+
+      if (isPdf) {
+        try {
+          const pdfPages = await convertPdfFileToImages(
+            file,
+            (pageNum, totalPages) => {
+              setOcrNotice(
+                `Đang tách trang ${pageNum}/${totalPages} từ file PDF "${file.name}"...`
+              );
+            }
+          );
+          pdfPages.forEach((p, pageIdx) => {
+            newImages.push({
+              id: `${file.name}-p${pageIdx + 1}-${Date.now()}-${i}`,
+              name: p.name,
+              mimeType: p.mimeType,
+              dataUrl: p.dataUrl,
+              status: "PENDING",
+            });
+          });
+        } catch (err: any) {
+          setOcrNotice(
+            `Không thể đọc file PDF "${file.name}": ${
+              err?.message || "Định dạng PDF không hợp lệ."
+            }`
+          );
+        }
+      } else {
+        const optimized = await optimizeImageForBatchOcr(file);
+        newImages.push({
+          id: `${file.name}-${Date.now()}-${i}`,
+          name: file.name,
+          mimeType: optimized.mimeType,
+          dataUrl: optimized.dataUrl,
+          status: "PENDING",
+        });
+      }
+    }
+
+    if (newImages.length === 0) {
+      if (imageInputRef.current) imageInputRef.current.value = "";
+      return;
     }
 
     const updatedList = [...images, ...newImages];
@@ -1205,7 +1262,7 @@ if __name__ == "__main__":
               <input
                 ref={imageInputRef}
                 type="file"
-                accept="image/*"
+                accept="image/*,.pdf,application/pdf"
                 multiple
                 onChange={handleImageUpload}
                 className="hidden"
@@ -1260,7 +1317,7 @@ if __name__ == "__main__":
               <div className="lg:col-span-5 bg-white border border-slate-200 rounded-lg flex flex-col overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2 bg-slate-50">
                   <div className="flex items-center gap-2 text-xs font-medium text-slate-700 truncate">
-                    <span>Ảnh Phiếu Chấm ({images.length})</span>
+                    <span>Phiếu Chấm ({images.length})</span>
                     {activeImage && (
                       <>
                         <span aria-hidden="true">·</span>
@@ -1271,7 +1328,16 @@ if __name__ == "__main__":
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => imageInputRef.current?.click()}
+                      className="px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors cursor-pointer flex items-center gap-1"
+                      title="Tải thêm file Ảnh hoặc PDF nhiều trang"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Tải Ảnh / PDF</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => setImageZoom((z) => Math.max(0.75, z - 0.25))}
@@ -1347,7 +1413,7 @@ if __name__ == "__main__":
                         onClick={() => imageInputRef.current?.click()}
                         className="px-4 py-2 text-xs font-bold text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors cursor-pointer"
                       >
-                        Chọn ảnh phiếu chấm từ máy
+                        Chọn ảnh hoặc file PDF phiếu chấm từ máy
                       </button>
                     </div>
                   )}

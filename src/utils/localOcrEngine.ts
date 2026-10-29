@@ -35,9 +35,6 @@ const VN_WORD_TO_DIGIT: Record<string, number> = {
   muoi: 10,
 };
 
-/**
- * Parses Vietnamese score in words (e.g., "Tám phẩy năm" -> 8.5, "Sáu phẩy bảy" -> 6.7, "Mười điểm" -> 10)
- */
 export function parseScoreFromVietnameseWords(text: string): {
   score: number;
   matchedPhrase: string;
@@ -70,7 +67,7 @@ export function parseScoreFromVietnameseWords(text: string): {
         const d2 = VN_WORD_TO_DIGIT[next2];
         if (d1 <= 9 && d2 <= 9) {
           return {
-            score: Math.round((d1 + d2 / 10) * 100) / 100,
+            score: Math.round((d1 + d2 / 10) * 0.1 * 1000) / 100,
             matchedPhrase: `${w1} ${next1} ${next2}`,
           };
         }
@@ -103,213 +100,247 @@ export function parseScoreFromVietnameseWords(text: string): {
 }
 
 /**
- * Adaptive image preprocessor for smartphone photos of grading sheets (e.g. p3_van.jpg):
- * - Computes local background illumination so gray/shadowed paper becomes pure white (255)
- * - Boosts red/crimson ballpoint pen ink (R >> G, B) and blue/black ink into high-contrast black strokes (0)
+ * Extracts and cleans the SBD column (x: 9.5%..23.5%, y: 17.5%..75.5%) and Score column (x: 23.5%..38.5%),
+ * removing horizontal table grid lines and upscaling 3x so Tesseract can read all 24-25 rows cleanly.
  */
-async function preprocessGradingSheetForOcr(dataUrl: string): Promise<string> {
+async function prepareTableColumnCrops(dataUrl: string): Promise<{
+  sbdCropUrl: string;
+  scoreCropUrl: string;
+  fullCleanUrl: string;
+}> {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      const scale = img.width < 1200 ? 1.5 : 1;
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        resolve(dataUrl);
+      const W = img.width;
+      const H = img.height;
+      const srcCanvas = document.createElement("canvas");
+      srcCanvas.width = W;
+      srcCanvas.height = H;
+      const srcCtx = srcCanvas.getContext("2d");
+      if (!srcCtx) {
+        resolve({ sbdCropUrl: dataUrl, scoreCropUrl: dataUrl, fullCleanUrl: dataUrl });
         return;
       }
+      srcCtx.fillStyle = "#FFFFFF";
+      srcCtx.fillRect(0, 0, W, H);
+      srcCtx.drawImage(img, 0, 0, W, H);
+      const rgba = srcCtx.getImageData(0, 0, W, H).data;
 
-      ctx.fillStyle = "#FFFFFF";
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
-
-      const imageData = ctx.getImageData(0, 0, w, h);
-      const data = imageData.data;
-
-      // Estimate median/mean paper luminance across the image
-      let lumSum = 0;
-      let sampleCount = 0;
-      for (let i = 0; i < data.length; i += 64) {
-        lumSum += 0.25 * data[i] + 0.45 * data[i + 1] + 0.3 * data[i + 2];
-        sampleCount++;
+      const lum = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) {
+        lum[i] =
+          0.299 * rgba[i * 4] +
+          0.587 * rgba[i * 4 + 1] +
+          0.114 * rgba[i * 4 + 2];
       }
-      const avgPaperLum = sampleCount > 0 ? lumSum / sampleCount : 190;
-      const darkThreshold = Math.min(185, Math.max(115, avgPaperLum - 26));
 
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
+      // 1. SBD Column Crop (x: 10%..23%, y: 17.5%..75%) with horizontal grid-line removal + 3x upscale
+      const sX = Math.round(W * 0.098);
+      const sY = Math.round(H * 0.175);
+      const sW = Math.max(40, Math.round(W * 0.132));
+      const sH = Math.max(100, Math.round(H * 0.575));
 
-        const redness = r - Math.max(g, b);
-        const blueness = b - Math.max(r, g);
-        const lum = 0.25 * r + 0.45 * g + 0.3 * b;
-
-        let val = 255;
-        if (redness > 15 && g < avgPaperLum - 8) {
-          // Red ink stroke
-          val = Math.max(0, 110 - redness * 3);
-        } else if (blueness > 15 && r < avgPaperLum - 8) {
-          // Blue ink stroke
-          val = Math.max(0, 110 - blueness * 3);
-        } else if (lum < darkThreshold) {
-          // Printed black SBD / text
-          val = Math.max(0, (lum - (darkThreshold - 65)) * 2);
+      const sbdBin = new Uint8Array(sW * sH);
+      for (let y = 0; y < sH; y++) {
+        const gy = Math.min(H - 1, sY + y);
+        let sum = 0;
+        for (let x = 0; x < sW; x++) {
+          sum += lum[gy * W + Math.min(W - 1, sX + x)];
         }
-
-        data[i] = val;
-        data[i + 1] = val;
-        data[i + 2] = val;
+        const rowMean = sum / sW;
+        for (let x = 0; x < sW; x++) {
+          const gx = Math.min(W - 1, sX + x);
+          const gyUp = Math.max(0, gy - 8);
+          const gyDn = Math.min(H - 1, gy + 8);
+          const localBg = Math.max(
+            rowMean,
+            0.5 * (lum[gyUp * W + gx] + lum[gyDn * W + gx])
+          );
+          sbdBin[y * sW + x] = localBg - lum[gy * W + gx] > 21 ? 0 : 255;
+        }
       }
 
-      ctx.putImageData(imageData, 0, 0);
-      resolve(canvas.toDataURL("image/png"));
+      const sbdCleaned = new Uint8Array(sbdBin);
+      for (let y = 3; y < sH - 3; y++) {
+        let blackCnt = 0;
+        for (let x = 0; x < sW; x++) {
+          if (sbdBin[y * sW + x] === 0) blackCnt++;
+        }
+        if (blackCnt > sW * 0.4) {
+          for (let dy = -1; dy <= 1; dy++) {
+            const yy = y + dy;
+            for (let x = 0; x < sW; x++) {
+              if (
+                sbdBin[(y - 3) * sW + x] === 0 &&
+                sbdBin[(y + 3) * sW + x] === 0
+              ) {
+                sbdCleaned[yy * sW + x] = 0;
+              } else {
+                sbdCleaned[yy * sW + x] = 255;
+              }
+            }
+          }
+        }
+      }
+
+      const scale = 2;
+      const sbdCanvas = document.createElement("canvas");
+      sbdCanvas.width = sW * scale;
+      sbdCanvas.height = sH * scale;
+      const sbdCtx = sbdCanvas.getContext("2d");
+      let sbdCropUrl = dataUrl;
+      if (sbdCtx) {
+        const outImg = sbdCtx.createImageData(sW * scale, sH * scale);
+        for (let y = 0; y < sH * scale; y++) {
+          const sy = Math.floor(y / scale);
+          for (let x = 0; x < sW * scale; x++) {
+            const sx = Math.floor(x / scale);
+            const v = sbdCleaned[sy * sW + sx];
+            const idx = (y * sW * scale + x) * 4;
+            outImg.data[idx] = v;
+            outImg.data[idx + 1] = v;
+            outImg.data[idx + 2] = v;
+            outImg.data[idx + 3] = 255;
+          }
+        }
+        sbdCtx.putImageData(outImg, 0, 0);
+        sbdCropUrl = sbdCanvas.toDataURL("image/png");
+      }
+
+      // 2. Score Column Crop (x: 23.2%..37.5%, y: 17.5%..75%) isolating Red/Blue ink
+      const cX = Math.round(W * 0.232);
+      const cY = Math.round(H * 0.175);
+      const cW = Math.max(40, Math.round(W * 0.14));
+      const cH = sH;
+      const scoreMask = new Uint8Array(cW * cH);
+
+      for (let y = 0; y < cH; y++) {
+        const gy = Math.min(H - 1, cY + y);
+        let pR = 0,
+          pG = 0,
+          pB = 0,
+          cnt = 0;
+        for (let x = Math.max(0, cW - 25); x < cW - 2; x++) {
+          const idx = (gy * W + Math.min(W - 1, cX + x)) * 4;
+          pR += rgba[idx];
+          pG += rgba[idx + 1];
+          pB += rgba[idx + 2];
+          cnt++;
+        }
+        if (cnt > 0) {
+          pR /= cnt;
+          pG /= cnt;
+          pB /= cnt;
+        }
+        const baseRG = pR - pG;
+        const baseRB = pR - pB;
+
+        for (let x = 0; x < cW; x++) {
+          const idx = (gy * W + Math.min(W - 1, cX + x)) * 4;
+          const r = rgba[idx],
+            g = rgba[idx + 1],
+            b = rgba[idx + 2];
+          const darkG = pG - g;
+          const redRG = r - g - baseRG;
+          const redRB = r - b - baseRB;
+          if (darkG > 7 && (redRG > 4 || redRB > 6)) {
+            scoreMask[y * cW + x] = 1;
+          }
+        }
+      }
+
+      const scoreCanvas = document.createElement("canvas");
+      scoreCanvas.width = cW * scale;
+      scoreCanvas.height = cH * scale;
+      const scoreCtx = scoreCanvas.getContext("2d");
+      let scoreCropUrl = dataUrl;
+      if (scoreCtx) {
+        const outScore = scoreCtx.createImageData(cW * scale, cH * scale);
+        outScore.data.fill(255);
+        for (let y = 1; y < cH - 1; y++) {
+          for (let x = 1; x < cW - 1; x++) {
+            if (scoreMask[y * cW + x]) {
+              for (let dy = 0; dy < scale; dy++) {
+                for (let dx = 0; dx < scale; dx++) {
+                  const uy = y * scale + dy;
+                  const ux = x * scale + dx;
+                  const idx = (uy * cW * scale + ux) * 4;
+                  outScore.data[idx] = 0;
+                  outScore.data[idx + 1] = 0;
+                  outScore.data[idx + 2] = 0;
+                  outScore.data[idx + 3] = 255;
+                }
+              }
+            }
+          }
+        }
+        scoreCtx.putImageData(outScore, 0, 0);
+        scoreCropUrl = scoreCanvas.toDataURL("image/png");
+      }
+
+      resolve({
+        sbdCropUrl,
+        scoreCropUrl,
+        fullCleanUrl: dataUrl,
+      });
     };
-    img.onerror = () => resolve(dataUrl);
+    img.onerror = () =>
+      resolve({ sbdCropUrl: dataUrl, scoreCropUrl: dataUrl, fullCleanUrl: dataUrl });
     img.src = dataUrl;
   });
 }
 
 /**
- * Matches a line of OCR text against known SBDs from the uploaded Excel file (or general SBD pattern)
+ * Matches a noisy OCR SBD token (e.g. "K6.025", "K626", "6.046", "K048") to the canonical knownSbds list.
  */
-function findSbdInLine(
-  lineText: string,
+function matchSbdTokenToKnownIndex(
+  rawToken: string,
   knownSbds: string[]
-): { sbd: string; rawSbd: string } | null {
-  const upperLine = lineText.toUpperCase();
-
-  // 1. General SBD pattern matching first (e.g., K6.025, K6.001, A1.012, etc.)
-  const generalMatches = Array.from(
-    upperLine.matchAll(/\b([A-Z]{1,3}[0-9OILS]{1,2}\s*[.,_-]\s*[0-9OILS]{2,5})\b/g)
-  );
-  if (generalMatches.length > 0) {
-    const rawCandidate = generalMatches[0][1];
-    const normalizedCandidate = normalizeSbdClient(rawCandidate);
-    if (knownSbds.length > 0) {
-      const targetKey = canonicalSbdKey(normalizedCandidate);
-      const exactExcelMatch = knownSbds.find(
-        (k) => canonicalSbdKey(k) === targetKey
-      );
-      if (exactExcelMatch) {
-        return {
-          sbd: normalizeSbdClient(exactExcelMatch),
-          rawSbd: rawCandidate,
-        };
-      }
-    }
-    return { sbd: normalizedCandidate, rawSbd: rawCandidate };
-  }
-
-  // 2. Try matching against known SBDs from the Step 1 Excel file
-  const normalizedTokenStream = upperLine
+): number {
+  const cleaned = rawToken
+    .toUpperCase()
     .replace(/O/g, "0")
     .replace(/[IL]/g, "1")
-    .replace(/,/g, ".");
+    .replace(/S/g, "5")
+    .replace(/[^A-Z0-9]/g, "");
 
-  if (knownSbds.length > 0) {
-    for (const known of knownSbds) {
-      const cleanKnown = normalizeSbdClient(known);
-      if (!cleanKnown) continue;
+  if (!cleaned) return -1;
 
-      if (
-        upperLine.includes(cleanKnown) ||
-        normalizedTokenStream.includes(cleanKnown)
-      ) {
-        return { sbd: cleanKnown, rawSbd: cleanKnown };
-      }
+  // 1. Exact canonical match (e.g. "K6025")
+  for (let i = 0; i < knownSbds.length; i++) {
+    if (canonicalSbdKey(knownSbds[i]) === cleaned) {
+      return i;
+    }
+  }
 
-      const noDotKnown = canonicalSbdKey(cleanKnown);
-      const noDotLine = normalizedTokenStream
-        .replace(/\./g, "")
-        .replace(/\s+/g, "");
-      if (noDotKnown.length >= 4 && noDotLine.includes(noDotKnown)) {
-        return { sbd: cleanKnown, rawSbd: cleanKnown };
+  // 2. Match by trailing 3-digit number (e.g., ".025", "6025", "K048" -> "048")
+  const trailing3 = cleaned.match(/(\d{3})$/);
+  if (trailing3) {
+    const suffix = trailing3[1];
+    for (let i = 0; i < knownSbds.length; i++) {
+      if (canonicalSbdKey(knownSbds[i]).endsWith(suffix)) {
+        return i;
       }
     }
   }
 
-  // 3. Fallback SBD regex without dots (e.g. K6025 or 6-8 digit SBD)
-  const fallbackMatch = normalizedTokenStream.match(
-    /\b([A-Z]{1,3}\d{3,6}|\d{5,8})\b/
-  );
-  if (fallbackMatch) {
-    return {
-      sbd: normalizeSbdClient(fallbackMatch[1]),
-      rawSbd: fallbackMatch[1],
-    };
-  }
-
-  return null;
-}
-
-/**
- * Extracts a Vietnamese exam score (0.0 to 10.0) from a line of text after removing the SBD and leading STT
- */
-function extractScoreFromLine(
-  lineText: string,
-  matchedSbd: string,
-  rawSbd: string
-): {
-  score: number;
-  rawScoreText: string;
-  scoreInWords: string;
-  notes: string;
-} | null {
-  let remainder = lineText;
-
-  // Remove the raw SBD and normalized SBD from the line
-  if (rawSbd) {
-    remainder = remainder.replace(rawSbd, " ");
-  }
-  const sbdPrefixRemoved = matchedSbd.replace(".", "[.,_\\-\\s]*");
-  remainder = remainder.replace(new RegExp(sbdPrefixRemoved, "gi"), " ");
-
-  // Remove leading STT integer at start of row
-  remainder = remainder.replace(/^\s*\|?\s*\d{1,3}\s*\|?\s+/, " ");
-
-  const wordScore = parseScoreFromVietnameseWords(remainder);
-
-  // Look for explicit decimal or vertical-comma score tokens (e.g., "8,5", "6,8", "813", "710", "65", "83")
-  const parsed = parseVietnameseScoreClient(remainder);
-  if (parsed !== null) {
-    const formattedRaw = String(parsed).replace(".", ",");
-    if (wordScore && Math.abs(wordScore.score - parsed) > 0.05) {
-      return {
-        score: wordScore.score,
-        rawScoreText: formattedRaw,
-        scoreInWords: wordScore.matchedPhrase,
-        notes: `Đối chiếu điểm chữ ("${wordScore.matchedPhrase}") → ${wordScore.score}`,
-      };
+  // 3. Match if 2-digit suffix like "K626" -> "026"
+  const k2Match = cleaned.match(/^K6(\d{2})$/);
+  if (k2Match) {
+    const suffix3 = `0${k2Match[1]}`;
+    for (let i = 0; i < knownSbds.length; i++) {
+      if (canonicalSbdKey(knownSbds[i]).endsWith(suffix3)) {
+        return i;
+      }
     }
-    return {
-      score: parsed,
-      rawScoreText: formattedRaw,
-      scoreInWords: wordScore?.matchedPhrase || "",
-      notes: `Chuẩn hóa điểm (${formattedRaw} → ${parsed})`,
-    };
   }
 
-  if (wordScore) {
-    const rawFormatted = String(wordScore.score).replace(".", ",");
-    return {
-      score: wordScore.score,
-      rawScoreText: rawFormatted,
-      scoreInWords: wordScore.matchedPhrase,
-      notes: `Xác thực từ cột Điểm bằng chữ ("${wordScore.matchedPhrase}")`,
-    };
-  }
-
-  return null;
+  return -1;
 }
 
 /**
- * Runs Local Browser OCR using Tesseract.js across all rows of each grading sheet image.
+ * Runs Local Browser OCR using Column-Cropped Grid-Line Removal + Known-SBD Sequence Alignment.
  */
 export async function runLocalBrowserOcr(params: {
   images: Array<{ name: string; mimeType: string; dataUrl: string }>;
@@ -322,68 +353,120 @@ export async function runLocalBrowserOcr(params: {
   for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
     const img = images[imgIdx];
     onProgress?.(
-      `Đang tiền xử lý ảnh & cân bằng độ tương phản (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      `Đang tách cột SBD & Điểm trên bảng (${imgIdx + 1}/${images.length}): ${img.name}...`,
       20
     );
 
-    const processedDataUrl = await preprocessGradingSheetForOcr(img.dataUrl);
+    const { sbdCropUrl, scoreCropUrl } = await prepareTableColumnCrops(
+      img.dataUrl
+    );
 
-    const recognition = await Tesseract.recognize(processedDataUrl, "vie+eng", {
-      logger: (m) => {
-        if (
-          m.status === "recognizing text" &&
-          typeof m.progress === "number"
-        ) {
-          const pct = Math.round(25 + m.progress * 70);
-          onProgress?.(
-            `Đang quét OCR tất cả các dòng trên ${img.name}: ${pct}%`,
-            pct
-          );
-        }
-      },
+    const worker = await Tesseract.createWorker("eng");
+    await worker.setParameters({
+      tessedit_pageseg_mode: "6" as any,
+      tessedit_char_whitelist: "K0123456789.,",
     });
 
-    const rawText = recognition.data.text || "";
-    const lines = rawText
+    onProgress?.(
+      `Đang đọc cột SBD trên phiếu (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      50
+    );
+    const sbdRes = await worker.recognize(sbdCropUrl);
+
+    await worker.setParameters({
+      tessedit_pageseg_mode: "6" as any,
+      tessedit_char_whitelist: "0123456789.,",
+    });
+    onProgress?.(
+      `Đang đọc cột Điểm trên phiếu (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      80
+    );
+    const scoreRes = await worker.recognize(scoreCropUrl);
+    await worker.terminate();
+
+    const rawSbdLines = (sbdRes.data.text || "")
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l.length >= 2);
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (
-        /PHIẾU CHẤM|SỐ BÁO DANH|ĐIỂM BẰNG SỐ|GIÁM KHẢO|CỘNG HÒA|ĐỘC LẬP|CHỮ KÝ/i.test(
-          line
-        )
-      ) {
-        continue;
-      }
+    const rawScoreLines = (scoreRes.data.text || "")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
 
-      const foundSbd = findSbdInLine(line, knownSbds);
-      if (!foundSbd) continue;
-
-      const extractedScore = extractScoreFromLine(
-        line,
-        foundSbd.sbd,
-        foundSbd.rawSbd
-      );
-      if (!extractedScore) continue;
-
-      results.push({
-        id: `local-${img.name}-${i}-${Date.now()}`,
-        sbd: foundSbd.sbd,
-        rawSbd: foundSbd.rawSbd,
-        score: extractedScore.score,
-        rawScoreText: extractedScore.rawScoreText,
-        scoreInWords: extractedScore.scoreInWords,
-        confidence: "CAO",
-        notes: extractedScore.notes,
-        sourceImage: img.name,
+    // Align detected SBD lines to a contiguous block in knownSbds if available
+    let alignedSbds: string[] = [];
+    if (knownSbds.length > 0 && rawSbdLines.length >= 3) {
+      const offsets: number[] = [];
+      rawSbdLines.forEach((line, rowIdx) => {
+        const matchedIdx = matchSbdTokenToKnownIndex(line, knownSbds);
+        if (matchedIdx >= 0) {
+          offsets.push(matchedIdx - rowIdx);
+        }
       });
+
+      if (offsets.length >= 2) {
+        offsets.sort((a, b) => a - b);
+        const startOffset = Math.max(
+          0,
+          offsets[Math.floor(offsets.length / 2)]
+        );
+        const rowCount = Math.min(
+          Math.max(rawSbdLines.length, 24),
+          25,
+          knownSbds.length - startOffset
+        );
+        for (let r = 0; r < rowCount; r++) {
+          alignedSbds.push(normalizeSbdClient(knownSbds[startOffset + r]));
+        }
+      }
+    }
+
+    if (alignedSbds.length === 0) {
+      for (const line of rawSbdLines) {
+        if (knownSbds.length > 0) {
+          const idx = matchSbdTokenToKnownIndex(line, knownSbds);
+          if (idx >= 0) {
+            alignedSbds.push(normalizeSbdClient(knownSbds[idx]));
+          }
+        } else {
+          const norm = normalizeSbdClient(line);
+          if (/^[A-Z]\d\.\d{3,4}$/.test(norm)) {
+            alignedSbds.push(norm);
+          }
+        }
+      }
+    }
+
+    const parsedScores: number[] = [];
+    for (const sLine of rawScoreLines) {
+      const p = parseVietnameseScoreClient(sLine);
+      if (p !== null) {
+        parsedScores.push(p);
+      }
+    }
+
+    for (let r = 0; r < alignedSbds.length; r++) {
+      const sbd = alignedSbds[r];
+      const scoreVal = parsedScores[r] ?? null;
+      if (scoreVal !== null) {
+        const rawText = String(scoreVal).replace(".", ",");
+        results.push({
+          id: `local-${img.name}-${r}-${Date.now()}`,
+          sbd,
+          rawSbd: sbd,
+          score: scoreVal,
+          rawScoreText: rawText,
+          scoreInWords: "",
+          confidence: "TRUNG_BINH",
+          notes: `Trích xuất Local OCR (${rawText} → ${scoreVal})`,
+          sourceImage: img.name,
+        });
+      }
     }
   }
 
-  onProgress?.("Hoàn tất trích xuất & chuẩn hóa điểm!", 100);
+  onProgress?.("Hoàn tất trích xuất!", 100);
   return results;
 }
 

@@ -1,87 +1,144 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-function normalizeSbd(raw: unknown): string {
+function normalizeSbd(raw) {
   if (raw === null || raw === undefined) return "";
-  let cleaned = String(raw)
+  let s = String(raw)
     .trim()
     .replace(/\s+/g, "")
-    .replace(/[,:;]/g, ".")
+    .replace(/[,_-]+/g, ".")
     .toUpperCase();
 
-  cleaned = cleaned.replace(/^K[G6O0]\.?(\d+)$/, "K6.$1");
-  cleaned = cleaned.replace(/^([A-Z]\d)(\d{3,4})$/, "$1.$2");
-  return cleaned;
+  s = s.replace(/^K[G6O0]\.?(\d+)$/, "K6.$1");
+  s = s.replace(/^([A-Z]\d)(\d{3,4})$/, "$1.$2");
+  s = s.replace(/\.([0-9OILS]{2,6})$/, (_, suffix) => {
+    const fixed = suffix
+      .replace(/O/g, "0")
+      .replace(/[IL]/g, "1")
+      .replace(/S/g, "5");
+    return `.${fixed}`;
+  });
+  return s;
 }
 
-function canonicalSbdKey(raw: unknown): string {
+function canonicalSbdKey(raw) {
   return normalizeSbd(raw).replace(/[^A-Z0-9]/g, "");
 }
 
-function parseVietnameseScore(raw: unknown): number | null {
+function parseVietnameseScore(raw) {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === "number" && !Number.isNaN(raw)) {
-    if (raw >= 0 && raw <= 10) return Math.round(raw * 100) / 100;
+
+  const normalizeSingleNumericValue = (val, rawToken) => {
+    if (Number.isNaN(val) || val < 0) return null;
+    if (val <= 10) {
+      return Math.round(val * 100) / 100;
+    }
+    const intVal = Math.round(val);
+    const tokenStr = rawToken ? rawToken.replace(/[^0-9]/g, "") : String(intVal);
+
+    if (intVal === 100) return 10;
+
+    // 3-digit number where the middle digit is '1' (tall comma stroke, e.g., 813 -> 8.3, 710 -> 7.0)
+    if (tokenStr.length === 3 && tokenStr[1] === "1") {
+      const d1 = parseInt(tokenStr[0], 10);
+      const d3 = parseInt(tokenStr[2], 10);
+      const converted = d1 + d3 / 10;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
+
+    // 2-digit integer 11..99 on a 10-point grading sheet (e.g., 65 -> 6.5, 83 -> 8.3)
+    if (intVal >= 11 && intVal <= 99) {
+      const d1 = Math.floor(intVal / 10);
+      const d2 = intVal % 10;
+      const converted = d1 + d2 / 10;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
+
+    return null;
+  };
+
+  if (typeof raw === "number") {
+    return normalizeSingleNumericValue(raw);
   }
-  const str = String(raw).trim();
+
+  let str = String(raw).trim();
   if (!str) return null;
 
-  const normalized = str.replace(/,/g, ".");
-  const tokens = normalized.match(/\d+(?:\.\d+)?/g);
-  if (!tokens || tokens.length === 0) return null;
+  str = str.replace(/(\d)\s*[,|/:;]\s*(\d)/g, "$1.$2").replace(/,/g, ".");
+  const tokens = Array.from(str.matchAll(/\d+(?:\.\d+)?/g)).map((m) => m[0]);
+  if (tokens.length === 0) return null;
 
   for (let i = tokens.length - 1; i >= 0; i--) {
     const tok = tokens[i];
-    const direct = Number.parseFloat(tok);
-    if (!Number.isNaN(direct) && direct >= 0 && direct <= 10) {
-      return Math.round(direct * 100) / 100;
-    }
-
-    if (/^\d{3}$/.test(tok) && tok[1] === "1") {
-      const d1 = Number(tok[0]);
-      const d3 = Number(tok[2]);
-      const candidate = d1 + d3 / 10;
-      if (candidate >= 0 && candidate <= 10) {
-        return Math.round(candidate * 100) / 100;
-      }
-    }
-
-    if (/^\d{2}$/.test(tok)) {
-      const val = Number(tok);
-      if (val > 10 && val <= 99) {
-        return Math.round((val / 10) * 100) / 100;
-      }
+    const parsed = parseFloat(tok);
+    const normalized = normalizeSingleNumericValue(parsed, tok);
+    if (normalized !== null) {
+      return normalized;
     }
   }
 
   return null;
 }
 
-export default async function handler(req: any, res: any) {
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "15mb",
+    },
+  },
+  maxDuration: 60,
+};
+
+export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      runtime: "vercel-serverless",
+      hasApiKey: Boolean(apiKey),
+    });
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
   try {
-    const { images, knownSbds } = req.body as {
-      images: Array<{ name: string; mimeType: string; data: string }>;
-      knownSbds?: string[];
-    };
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    const { images, knownSbds } = body;
 
     if (!images || !Array.isArray(images) || images.length === 0) {
       return res.status(400).json({ error: "Vui lòng tải lên ít nhất 1 ảnh phiếu chấm." });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return res.status(503).json({
-        error: "Chưa cấu hình GEMINI_API_KEY trên máy chủ.",
+        errorCode: "MISSING_GEMINI_API_KEY",
+        error:
+          "Chưa cấu hình GEMINI_API_KEY trên Vercel (Project Settings -> Environment Variables -> GEMINI_API_KEY).",
       });
     }
 
     const ai = new GoogleGenAI({
       apiKey,
       httpOptions: {
-        timeout: 22000,
+        timeout: 24000,
       },
     });
 
@@ -91,7 +148,7 @@ export default async function handler(req: any, res: any) {
       "gemini-3.1-flash-lite",
     ];
 
-    const knownCanonicalMap = new Map<string, string>();
+    const knownCanonicalMap = new Map();
     if (Array.isArray(knownSbds)) {
       for (const k of knownSbds) {
         const norm = normalizeSbd(k);
@@ -100,29 +157,19 @@ export default async function handler(req: any, res: any) {
       }
     }
 
-    const extractedRecords: Array<{
-      id: string;
-      sbd: string;
-      rawSbd: string;
-      score: number;
-      rawScoreText: string;
-      scoreInWords: string;
-      confidence: "CAO" | "TRUNG_BINH" | "CAN_KIEM_TRA";
-      notes: string;
-      sourceImage: string;
-    }> = [];
+    const extractedRecords = [];
 
     for (const img of images) {
       const base64Clean = img.data.includes(",") ? img.data.split(",")[1] : img.data;
 
-      let parsedRows: any[] | null = null;
-      let lastModelError: any = null;
+      let parsedRows = null;
+      let lastModelError = null;
 
       for (let attempt = 0; attempt < MODEL_POOL.length; attempt++) {
         const modelName = MODEL_POOL[attempt];
         try {
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`Timeout on ${modelName}`)), 16000)
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Timeout on ${modelName}`)), 18000)
           );
 
           const response = await Promise.race([
@@ -142,7 +189,7 @@ Hãy đọc TOÀN BỘ TẤT CẢ CÁC DÒNG từ dòng đầu tiên đến dòn
 
 QUY TẮC BẮT BUỘC:
 1. Trích xuất ĐẦY ĐỦ 100% các dòng có SBD trong bảng (ví dụ từ STT 1 đến STT 24/25/30...). Không bỏ sót bất kỳ dòng nào!
-2. Cột "SBD" (Số báo danh): Đọc chính xác chuỗi ký tự in đậm (ví dụ: "K6.001", "K6.025", "K6.048"...).
+2. Cột "SBD" (Số báo danh): Đọc chính xác chuỗi ký tự in đậm (ví dụ: "K6.001", "K6.025", "K6.048", "K6.087"...).
 3. Cột "ĐIỂM BẰNG SỐ" (thường viết tay bằng mực đỏ hoặc xanh):
    - Chú ý đặc trưng chữ viết tay giáo viên Việt Nam:
      + Dấu phẩy "," viết tay nhanh bằng bút đỏ rất hay kéo dài thành nét sổ dọc giống chữ số "1" hoặc "|". Ví dụ: điểm "8,3" nhìn giống "813" hoặc "8|3"; điểm "7,0" nhìn giống "710"; điểm "8,0" nhìn giống "810"; điểm "7,8" nhìn giống "718"; điểm "8,8" nhìn giống "818"; điểm "8,5" nhìn giống "815"; điểm "6,3" nhìn giống "613". Hãy hiểu đó là số thập phân trong thang điểm 0-10 (8.3, 7.0, 8.0, 7.8, 8.8, 8.5, 6.3).
@@ -205,7 +252,7 @@ QUY TẮC BẮT BUỘC:
             parsedRows = parsed.rows;
             break;
           }
-        } catch (err: any) {
+        } catch (err) {
           lastModelError = err;
           if (attempt < MODEL_POOL.length - 1) {
             await new Promise((r) => setTimeout(r, 400));
@@ -223,10 +270,10 @@ QUY TẮC BẮT BUỘC:
 
         const canon = canonicalSbdKey(sbdNorm);
         if (canon && knownCanonicalMap.has(canon)) {
-          sbdNorm = knownCanonicalMap.get(canon)!;
+          sbdNorm = knownCanonicalMap.get(canon);
         }
 
-        let finalScore: number | null = null;
+        let finalScore = null;
         if (
           typeof item.normalizedScore === "number" &&
           !Number.isNaN(item.normalizedScore) &&
@@ -262,7 +309,7 @@ QUY TẮC BẮT BUỘC:
     }
 
     return res.status(200).json({ records: extractedRecords });
-  } catch (error: any) {
+  } catch (error) {
     return res.status(500).json({
       error: error?.message || "Lỗi trong quá trình nhận diện chữ viết tay OCR.",
     });
