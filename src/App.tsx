@@ -1255,7 +1255,7 @@ export default function App() {
               </div>
               <div>
                 <div className="text-[11px] text-slate-500">
-                  File Excel 1 · Bảng Điểm SBD (Hình 1)
+                  File Excel 1 · Bảng Điểm SBD
                 </div>
                 <div className="text-xs font-bold text-slate-900 font-mono">
                   {excelData ? excelData.fileName : "Chưa tải lên"}
@@ -1275,7 +1275,7 @@ export default function App() {
               </div>
               <div>
                 <div className="text-[11px] text-slate-500">
-                  File Excel 2 · Bảng Mã Phách (Hình 2)
+                  File Excel 2 · Bảng Mã Phách
                 </div>
                 <div className="text-xs font-bold text-slate-900 font-mono">
                   {phachExcelData
@@ -1376,7 +1376,7 @@ export default function App() {
                     <span className="font-mono font-semibold text-slate-700">
                       Điểm
                     </span>{" "}
-                    để xuất ra thành file Excel.
+                    
                   </p>
                   {excelData && (
                     <div className="pt-1 text-xs font-bold text-emerald-700 font-mono">
@@ -1862,15 +1862,6 @@ export default function App() {
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       type="button"
-                      onClick={() => imageInputRef.current?.click()}
-                      className="px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors cursor-pointer flex items-center gap-1"
-                      title="Tải thêm file Ảnh hoặc PDF nhiều trang"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Tải Ảnh / PDF</span>
-                    </button>
-                    <button
-                      type="button"
                       onClick={() => setImageZoom((z) => Math.max(0.75, z - 0.25))}
                       className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-200/60 rounded transition-colors cursor-pointer"
                       title="Thu nhỏ"
@@ -2152,16 +2143,9 @@ export default function App() {
                       ) : resolvedOcrRecords.length === 0 ? (
                         <div className="p-12 text-center space-y-4">
                           <div className="text-sm font-semibold text-slate-700">
-                            Chưa có dữ liệu điểm nào từ Phiếu Chấm (Hình 3)
+                            Chưa có dữ liệu điểm nào từ Phiếu Chấm
                           </div>
                           <div className="flex items-center justify-center gap-3">
-                            <button
-                              type="button"
-                              onClick={() => imageInputRef.current?.click()}
-                              className="px-3.5 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
-                            >
-                              Tải File PDF / Ảnh Phiếu Chấm
-                            </button>
                             <button
                               type="button"
                               onClick={() => setEngineMode("RAPID_KEYBOARD")}
