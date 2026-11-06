@@ -1365,7 +1365,7 @@ export default function App() {
                     <FileSpreadsheet className="w-5 h-5" />
                   </div>
                   <div className="text-sm font-bold text-slate-900">
-                    File Excel Nguồn 1: Bảng Điểm Thí Sinh (Hình 1)
+                    File Excel Nguồn 1: Bảng Điểm Thí Sinh
                   </div>
                   <p className="text-xs text-slate-500 max-w-md mx-auto">
                     File chứa danh sách học sinh, cột{" "}
@@ -1376,7 +1376,7 @@ export default function App() {
                     <span className="font-mono font-semibold text-slate-700">
                       Điểm
                     </span>{" "}
-                    để xuất ra thành Hình 4.
+                    để xuất ra thành file Excel.
                   </p>
                   {excelData && (
                     <div className="pt-1 text-xs font-bold text-emerald-700 font-mono">
@@ -1428,7 +1428,7 @@ export default function App() {
                     <Link2 className="w-5 h-5" />
                   </div>
                   <div className="text-sm font-bold text-slate-900">
-                    File Excel Nguồn 2: Bảng Ghép Mã Phách (Hình 2)
+                    File Excel Nguồn 2: Bảng Ghép Mã Phách
                   </div>
                   <p className="text-xs text-slate-500 max-w-md mx-auto">
                     File chứa cột{" "}
@@ -1470,7 +1470,7 @@ export default function App() {
                       Cấu Trúc Cột Đã Nhận Diện &amp; Đối Chiếu SBD ↔ MÃ PHÁCH
                     </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Hệ thống tự động liên kết cột SBD của Hình 1 với cột SBD &amp; MÃ PHÁCH của Hình 2.
+                      Hệ thống tự động liên kết cột SBD file Bảng điểm với cột SBD &amp; MÃ PHÁCH file Phách.
                     </p>
                   </div>
 
@@ -1480,7 +1480,7 @@ export default function App() {
                       onClick={() => setCurrentStep(2)}
                       className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
                     >
-                      <span>Tiếp tục: Bước 2 — Tải PDF/Ảnh Hình 3 &amp; Khớp Điểm</span>
+                      <span>Tiếp tục: Bước 2 — Tải PDF/Ảnh &amp; Khớp Điểm</span>
                       <ArrowRight className="w-4 h-4" />
                     </button>
                   )}
@@ -1551,7 +1551,7 @@ export default function App() {
                           htmlFor="step1-sbd-col"
                           className="text-[11px] font-semibold text-amber-900 block mb-1"
                         >
-                          Cột SBD (Hình 1):
+                          Cột SBD:
                         </label>
                         <select
                           id="step1-sbd-col"
