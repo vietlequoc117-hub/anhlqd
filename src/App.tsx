@@ -1322,20 +1322,7 @@ export default function App() {
                 <h1 className="text-xl font-bold text-slate-900">
                   01. Tải Lên 2 File Excel Nguồn (Bảng Điểm SBD &amp; Bảng Ghép Mã Phách)
                 </h1>
-                <p className="text-xs text-slate-500 mt-1">
-                  Tải lên File Excel 1 (Bảng điểm có cột SBD &amp; Điểm như Hình 1) và File Excel 2 (Bảng ghép cột SBD ↔ MÃ PHÁCH như Hình 2). Bạn có thể chọn từng file hoặc bôi đen chọn cả 2 file cùng lúc.
-                </p>
               </div>
-
-              <button
-                type="button"
-                onClick={handleLoadSamplePhachWorkspace}
-                disabled={isExcelLoading}
-                className="px-3.5 py-2 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors flex items-center gap-1.5 shrink-0 cursor-pointer"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Thử Mẫu Hình 1 + Hình 2 + Hình 3 → Hình 4 (Anh 9)</span>
-              </button>
             </div>
 
             {excelError && (
@@ -1801,17 +1788,6 @@ export default function App() {
                 <h1 className="text-xl font-bold text-slate-900">
                   02. Tải File PDF / Ảnh Phiếu Chấm (Hình 3) &amp; Xuất File Excel (Hình 4)
                 </h1>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Hệ thống tự động đọc cột{" "}
-                  <span className="font-mono font-semibold text-slate-700">
-                    MÃ PHÁCH
-                  </span>{" "}
-                  (hoặc SBD) và{" "}
-                  <span className="font-mono font-semibold text-slate-700">
-                    ĐIỂM BẰNG SỐ
-                  </span>{" "}
-                  trên phiếu chấm (Hình 3), đối chiếu qua Bảng Mã Phách (Hình 2) để điền điểm vào đúng học sinh trên Bảng Điểm (Hình 4).
-                </p>
               </div>
 
               <input
