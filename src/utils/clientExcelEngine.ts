@@ -83,14 +83,101 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+function detectSheetColumns(worksheet: ExcelJS.Worksheet): {
+  headerRow: number;
+  sbdCol: string;
+  phachCol: string;
+  scoreCol: string;
+} {
+  let detectedHeaderRow = 5;
+  let detectedSbdCol = "G";
+  let detectedPhachCol = "";
+  let detectedScoreCol = "I";
+
+  for (let r = 1; r <= Math.min(18, worksheet.rowCount); r++) {
+    const row = worksheet.getRow(r);
+    let foundSbd = "";
+    let foundPhach = "";
+    let foundScore = "";
+
+    row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      const text = String(extractCellValue(cell.value) ?? "")
+        .replace(/[\r\n]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+
+      if (
+        text.includes("số bd") ||
+        text.includes("sbd") ||
+        text.includes("số báo danh") ||
+        text === "mã sbd"
+      ) {
+        foundSbd = colNumberToLetter(colNumber);
+      }
+      if (
+        text.includes("mã phách") ||
+        text.includes("ma phach") ||
+        text === "phách" ||
+        text.includes("số phách")
+      ) {
+        foundPhach = colNumberToLetter(colNumber);
+      }
+      if (
+        text === "điểm" ||
+        text === "điểm số" ||
+        text === "điểm thi" ||
+        text.includes("điểm bằng số")
+      ) {
+        foundScore = colNumberToLetter(colNumber);
+      }
+    });
+
+    if (foundSbd || foundPhach || foundScore) {
+      detectedHeaderRow = r;
+      if (foundSbd) detectedSbdCol = foundSbd;
+      if (foundPhach) detectedPhachCol = foundPhach;
+      if (foundScore) detectedScoreCol = foundScore;
+      break;
+    }
+  }
+
+  return {
+    headerRow: detectedHeaderRow,
+    sbdCol: detectedSbdCol,
+    phachCol: detectedPhachCol,
+    scoreCol: detectedScoreCol,
+  };
+}
+
+/**
+ * Automatically classifies whether a loaded Excel file is:
+ * - "PHACH_MAP" (Hình 2: Bảng ghép SBD <-> MÃ PHÁCH, has a MÃ PHÁCH column)
+ * - "ROSTER_SBD" (Hình 1: Bảng điểm thí sinh chính thức có Họ và tên, Ngày sinh, SBD, Điểm)
+ */
+export function detectExcelFileRole(
+  data: ExcelSheetData
+): "ROSTER_SBD" | "PHACH_MAP" {
+  if (data.detectedPhachCol) {
+    return "PHACH_MAP";
+  }
+  const hasPhachHeader = data.headers.some((h) => {
+    const lbl = h.label.toLowerCase();
+    return lbl.includes("phách") || lbl.includes("ma phach");
+  });
+  return hasPhachHeader ? "PHACH_MAP" : "ROSTER_SBD";
+}
+
 /**
  * 100% Client-Side Excel Inspector (Runs directly in browser on Vercel / GitHub Pages without backend API)
+ * Supports both Hình 1 (Bảng điểm SBD) and Hình 2 (Bảng ghép SBD <-> MÃ PHÁCH).
  */
 export async function parseExcelClientSide(params: {
   fileBase64: string;
   fileName: string;
   preferredHeaderRow?: number;
   preferredSbdCol?: string;
+  preferredPhachCol?: string;
   preferredScoreCol?: string;
   targetSheetIndex?: number;
 }): Promise<ExcelSheetData> {
@@ -99,6 +186,7 @@ export async function parseExcelClientSide(params: {
     fileName,
     preferredHeaderRow,
     preferredSbdCol,
+    preferredPhachCol,
     preferredScoreCol,
     targetSheetIndex,
   } = params;
@@ -125,46 +213,12 @@ export async function parseExcelClientSide(params: {
     throw new Error("File Excel không có trang tính (worksheet) nào.");
   }
 
-  let detectedHeaderRow = preferredHeaderRow || 5;
-  let detectedSbdCol = preferredSbdCol || "G";
-  let detectedScoreCol = preferredScoreCol || "I";
-
-  if (!preferredHeaderRow) {
-    for (let r = 1; r <= Math.min(15, worksheet.rowCount); r++) {
-      const row = worksheet.getRow(r);
-      let foundSbd = "";
-      let foundScore = "";
-      row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
-        const text = String(extractCellValue(cell.value) ?? "")
-          .replace(/[\r\n]+/g, " ")
-          .replace(/\s+/g, " ")
-          .trim()
-          .toLowerCase();
-        if (
-          text.includes("số bd") ||
-          text.includes("sbd") ||
-          text.includes("số báo danh") ||
-          text === "mã sbd"
-        ) {
-          foundSbd = colNumberToLetter(colNumber);
-        }
-        if (
-          text === "điểm" ||
-          text === "điểm số" ||
-          text === "điểm thi" ||
-          text.includes("điểm bằng số")
-        ) {
-          foundScore = colNumberToLetter(colNumber);
-        }
-      });
-      if (foundSbd || foundScore) {
-        detectedHeaderRow = r;
-        if (foundSbd && !preferredSbdCol) detectedSbdCol = foundSbd;
-        if (foundScore && !preferredScoreCol) detectedScoreCol = foundScore;
-        break;
-      }
-    }
-  }
+  const autoDetected = detectSheetColumns(worksheet);
+  const detectedHeaderRow = preferredHeaderRow || autoDetected.headerRow;
+  const detectedSbdCol = preferredSbdCol || autoDetected.sbdCol;
+  const detectedPhachCol =
+    preferredPhachCol !== undefined ? preferredPhachCol : autoDetected.phachCol;
+  const detectedScoreCol = preferredScoreCol || autoDetected.scoreCol;
 
   const titleRows: Array<{ rowNumber: number; texts: string[] }> = [];
   for (let r = 1; r < detectedHeaderRow; r++) {
@@ -182,7 +236,7 @@ export async function parseExcelClientSide(params: {
   }
 
   const headerRowObj = worksheet.getRow(detectedHeaderRow);
-  const maxCol = Math.max(worksheet.columnCount, 10);
+  const maxCol = Math.max(worksheet.columnCount, 6);
   const headers: ExcelHeaderCol[] = [];
 
   for (let c = 1; c <= maxCol; c++) {
@@ -193,7 +247,7 @@ export async function parseExcelClientSide(params: {
       .trim();
     const label = rawLabel === "ST T" ? "STT" : rawLabel;
     const colWidth = worksheet.getColumn(c).width || 12;
-    if (label || c <= 10) {
+    if (label || c <= worksheet.columnCount) {
       headers.push({
         colLetter,
         colNumber: c,
@@ -204,6 +258,7 @@ export async function parseExcelClientSide(params: {
   }
 
   const sbdColNum = colLetterToNumber(detectedSbdCol);
+  const phachColNum = detectedPhachCol ? colLetterToNumber(detectedPhachCol) : 0;
   const scoreColNum = colLetterToNumber(detectedScoreCol);
   const studentRows: ExcelStudentRow[] = [];
 
@@ -211,6 +266,10 @@ export async function parseExcelClientSide(params: {
     const row = worksheet.getRow(r);
     const sbdRaw = extractCellValue(row.getCell(sbdColNum).value);
     const sbdStr = sbdRaw !== null ? String(sbdRaw).trim() : "";
+
+    const phachRaw =
+      phachColNum > 0 ? extractCellValue(row.getCell(phachColNum).value) : null;
+    const phachStr = phachRaw !== null ? String(phachRaw).trim() : "";
 
     let nonEmptyCount = 0;
     const cells: Record<string, string | number | null> = {};
@@ -223,6 +282,18 @@ export async function parseExcelClientSide(params: {
     }
 
     if (nonEmptyCount === 0) continue;
+
+    // Skip footer signature rows like "CHỮ KÝ CỦA CBCT" where SBD is empty or non-code
+    const rowJoinedLower = Object.values(cells)
+      .map((v) => String(v ?? "").toLowerCase())
+      .join(" ");
+    if (
+      !sbdStr &&
+      !phachStr &&
+      (rowJoinedLower.includes("chữ ký") || rowJoinedLower.includes("cbct"))
+    ) {
+      continue;
+    }
 
     const scoreCell = row.getCell(scoreColNum);
     const currentScore = extractCellValue(scoreCell.value);
@@ -240,11 +311,59 @@ export async function parseExcelClientSide(params: {
       rowNumber: r,
       sbd: sbdStr,
       normalizedSbd: normalizeSbdClient(sbdStr),
+      maPhach: phachStr,
+      normalizedPhach: normalizeSbdClient(phachStr),
       currentScore,
       cells,
       fontName,
       hasBorder,
     });
+  }
+
+  // Also scan all worksheets for SBD <-> MÃ PHÁCH pairs in case File Excel 2 has multiple sheets
+  const allSheetsPhachPairs: Array<{
+    sheetName: string;
+    rowNumber: number;
+    sbd: string;
+    normalizedSbd: string;
+    maPhach: string;
+    normalizedPhach: string;
+  }> = [];
+
+  for (let wsIdx = 0; wsIdx < workbook.worksheets.length; wsIdx++) {
+    const ws = workbook.worksheets[wsIdx];
+    const cols =
+      wsIdx === sheetIdx
+        ? {
+            headerRow: detectedHeaderRow,
+            sbdCol: detectedSbdCol,
+            phachCol: detectedPhachCol,
+          }
+        : detectSheetColumns(ws);
+
+    if (!cols.sbdCol || !cols.phachCol) continue;
+    const sCol = colLetterToNumber(cols.sbdCol);
+    const pCol = colLetterToNumber(cols.phachCol);
+
+    for (let r = cols.headerRow + 1; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      const rawSbd = extractCellValue(row.getCell(sCol).value);
+      const rawPhach = extractCellValue(row.getCell(pCol).value);
+      const sbdStr = rawSbd !== null ? String(rawSbd).trim() : "";
+      const phachStr = rawPhach !== null ? String(rawPhach).trim() : "";
+      if (!sbdStr && !phachStr) continue;
+      const normSbd = normalizeSbdClient(sbdStr);
+      if (!normSbd) continue;
+
+      allSheetsPhachPairs.push({
+        sheetName: ws.name,
+        rowNumber: r,
+        sbd: sbdStr,
+        normalizedSbd: normSbd,
+        maPhach: phachStr,
+        normalizedPhach: normalizeSbdClient(phachStr),
+      });
+    }
   }
 
   const mergesCount =
@@ -253,7 +372,7 @@ export async function parseExcelClientSide(params: {
       : 0) || 0;
 
   return {
-    fileName: fileName || "Bang_Diem_Thi_Van_6_THCS_My_Xa.xlsx",
+    fileName: fileName || "Bang_Diem_Thi.xlsx",
     fileBase64,
     availableSheets,
     currentSheetIndex: sheetIdx,
@@ -262,15 +381,18 @@ export async function parseExcelClientSide(params: {
     mergedCellsCount: mergesCount,
     detectedHeaderRow,
     detectedSbdCol,
+    detectedPhachCol: detectedPhachCol || undefined,
     detectedScoreCol,
     titleRows,
     headers,
     studentRows,
+    allSheetsPhachPairs,
   };
 }
 
 /**
  * 100% Client-Side Non-Destructive Excel Updater (Preserves all formatting, borders, merges, fonts)
+ * Supports matching directly by SBD OR via 3-way SBD <-> MÃ PHÁCH <-> ĐIỂM BẰNG SỐ lookup.
  */
 export async function exportUpdatedExcelClientSide(params: {
   fileBase64: string;
@@ -279,10 +401,21 @@ export async function exportUpdatedExcelClientSide(params: {
   sbdCol: string;
   scoreCol: string;
   sheetIndex?: number;
-  ocrRecords: Array<{ sbd: string; score: number }>;
+  ocrRecords: Array<{ sbd: string; maPhach?: string; score: number }>;
+  sbdToPhachMap?: Record<string, string>;
+  phachToSbdMap?: Record<string, string>;
 }) {
-  const { fileBase64, fileName, headerRow, sbdCol, scoreCol, sheetIndex, ocrRecords } =
-    params;
+  const {
+    fileBase64,
+    fileName,
+    headerRow,
+    sbdCol,
+    scoreCol,
+    sheetIndex,
+    ocrRecords,
+    sbdToPhachMap,
+    phachToSbdMap,
+  } = params;
 
   const arrayBuffer = base64ToArrayBuffer(fileBase64);
   const workbook = new ExcelJS.Workbook();
@@ -299,14 +432,40 @@ export async function exportUpdatedExcelClientSide(params: {
     throw new Error("File Excel không hợp lệ.");
   }
 
+  // Build score lookup map indexed by SBD, canonical SBD, Mã Phách, and canonical Mã Phách
   const ocrMap: Record<string, number> = {};
   for (const rec of ocrRecords || []) {
-    const norm = normalizeSbdClient(rec.sbd);
-    const canon = canonicalSbdKey(rec.sbd);
     const val = parseVietnameseScoreClient(rec.score);
-    if (val !== null) {
-      if (norm) ocrMap[norm] = val;
-      if (canon) ocrMap[canon] = val;
+    if (val === null) continue;
+
+    const rawCode = rec.sbd;
+    const normCode = normalizeSbdClient(rawCode);
+    const canonCode = canonicalSbdKey(rawCode);
+
+    if (normCode) ocrMap[normCode] = val;
+    if (canonCode) ocrMap[canonCode] = val;
+
+    if (rec.maPhach) {
+      const normP = normalizeSbdClient(rec.maPhach);
+      const canonP = canonicalSbdKey(rec.maPhach);
+      if (normP) ocrMap[normP] = val;
+      if (canonP) ocrMap[canonP] = val;
+      if (phachToSbdMap) {
+        const mappedSbd = phachToSbdMap[normP] || phachToSbdMap[canonP];
+        if (mappedSbd) {
+          ocrMap[normalizeSbdClient(mappedSbd)] = val;
+          ocrMap[canonicalSbdKey(mappedSbd)] = val;
+        }
+      }
+    }
+
+    // Also check if `rec.sbd` itself is actually a Mã Phách code in `phachToSbdMap`
+    if (phachToSbdMap) {
+      const mappedSbd = phachToSbdMap[normCode] || phachToSbdMap[canonCode];
+      if (mappedSbd) {
+        ocrMap[normalizeSbdClient(mappedSbd)] = val;
+        ocrMap[canonicalSbdKey(mappedSbd)] = val;
+      }
     }
   }
 
@@ -316,7 +475,12 @@ export async function exportUpdatedExcelClientSide(params: {
 
   let matchedCount = 0;
   let untouchedCount = 0;
-  const matchedDetails: Array<{ rowNumber: number; sbd: string; score: number }> = [];
+  const matchedDetails: Array<{
+    rowNumber: number;
+    sbd: string;
+    maPhach?: string;
+    score: number;
+  }> = [];
 
   for (let r = startRow; r <= worksheet.rowCount; r++) {
     const row = worksheet.getRow(r);
@@ -325,12 +489,25 @@ export async function exportUpdatedExcelClientSide(params: {
     const canonSbd = canonicalSbdKey(rawSbd);
     if (!normSbd && !canonSbd) continue;
 
+    const linkedPhach =
+      sbdToPhachMap?.[normSbd] || sbdToPhachMap?.[canonSbd] || "";
+    const normPhach = normalizeSbdClient(linkedPhach);
+    const canonPhach = canonicalSbdKey(linkedPhach);
+
+    // If sbdToPhachMap is active and this student exists in the roster with an explicitly blank Mã Phách (like K9.002 in Hình 2),
+    // only match if they have a valid SBD direct score or a non-empty Mã Phách score
     const matchedVal =
       (normSbd && Object.prototype.hasOwnProperty.call(ocrMap, normSbd)
         ? ocrMap[normSbd]
         : undefined) ??
       (canonSbd && Object.prototype.hasOwnProperty.call(ocrMap, canonSbd)
         ? ocrMap[canonSbd]
+        : undefined) ??
+      (normPhach && Object.prototype.hasOwnProperty.call(ocrMap, normPhach)
+        ? ocrMap[normPhach]
+        : undefined) ??
+      (canonPhach && Object.prototype.hasOwnProperty.call(ocrMap, canonPhach)
+        ? ocrMap[canonPhach]
         : undefined);
 
     if (matchedVal !== undefined) {
@@ -342,6 +519,7 @@ export async function exportUpdatedExcelClientSide(params: {
       matchedDetails.push({
         rowNumber: r,
         sbd: String(rawSbd).trim(),
+        maPhach: linkedPhach || undefined,
         score: numericScore,
       });
     } else {
@@ -358,58 +536,66 @@ export async function exportUpdatedExcelClientSide(params: {
       : 0) || 0;
 
   const auditLines = [
-    `[Kiểm định Cấu trúc Bảng tính Sau Khi So Khớp SBD]`,
+    `[Kiểm định Cấu trúc Bảng tính Sau Khi So Khớp SBD ↔ MÃ PHÁCH ↔ ĐIỂM]`,
     ` - Trang tính đã xử lý: ${worksheet.name}`,
     ` - Số vùng gộp ô (Merged Cells) được bảo toàn: ${mergesCount}`,
     ` - Số ô cột ${scoreCol} (Điểm) đã ghi kiểu Float/Number: ${matchedCount}`,
     ...matchedDetails
-      .slice(0, 10)
-      .map((d) => `   + Hàng ${d.rowNumber} | SBD ${d.sbd} -> Ô ${scoreCol}${d.rowNumber} = ${d.score}`),
+      .slice(0, 12)
+      .map(
+        (d) =>
+          `   + Hàng ${d.rowNumber} | SBD ${d.sbd}${
+            d.maPhach ? ` (Mã phách: ${d.maPhach})` : ""
+          } -> Ô ${scoreCol}${d.rowNumber} = ${d.score}`
+      ),
   ];
 
-  const entries = Object.entries(ocrMap)
-    .map(([k, v]) => `    "${k}": ${v},`)
+  const entries = matchedDetails
+    .map(
+      (d) =>
+        `    "${normalizeSbdClient(d.sbd)}": ${d.score},${
+          d.maPhach ? `  # Mã phách: ${d.maPhach}` : ""
+        }`
+    )
     .join("\n");
 
   const openpyxlCode = `import re
 import openpyxl
 
-def normalize_sbd(value) -> str:
-    """Chuẩn hóa mã Số Báo Danh (loại bỏ khoảng trắng thừa, viết hoa)."""
+def normalize_code(value) -> str:
+    """Chuẩn hóa mã Số Báo Danh / Mã Phách."""
     if value is None:
         return ""
     return re.sub(r"\\s+", "", str(value).strip()).replace(",", ".").upper()
 
 def update_exam_scores(input_excel_path: str, output_excel_path: str):
-    # 1. Dữ liệu (SBD -> Điểm số Float) đã trích xuất từ Hình 1 (PHIẾU CHẤM BÀI THI)
-    ocr_scores: dict[str, float] = {
+    # 1. Dữ liệu (SBD -> Điểm số Float) sau khi khớp SBD (Hình 1) <-> MÃ PHÁCH (Hình 2) <-> ĐIỂM BẰNG SỐ (Hình 3)
+    matched_sbd_scores: dict[str, float] = {
 ${entries || "    # Chưa có dữ liệu điểm"}
     }
 
-    # 2. Mở file Excel nguồn (Hình 2) — giữ nguyên hoàn toàn định dạng, merge cells, borders, font
+    # 2. Mở file Excel nguồn (Hình 1) — giữ nguyên 100% định dạng, merge cells, borders, font
     wb = openpyxl.load_workbook(input_excel_path, data_only=False)
     sheet_names = wb.sheetnames
     ws = wb[sheet_names[${targetIdx}]] if len(sheet_names) > ${targetIdx} else wb.active
 
-    HEADER_ROW = ${headerRow}
     START_ROW = ${startRow}
     SBD_COL = "${sbdCol}"
     SCORE_COL = "${scoreCol}"
 
     matched_count = 0
 
-    # 3. Quét danh sách SBD ở cột ${sbdCol} từ hàng ${startRow} trở đi và khớp điểm vào cột ${scoreCol} (Hình 3)
+    # 3. Quét cột SBD (${sbdCol}) từ hàng ${startRow} trở đi và ghi điểm vào cột Điểm (${scoreCol}) thành Hình 4
     for row_idx in range(START_ROW, ws.max_row + 1):
         raw_sbd = ws[f"{SBD_COL}{row_idx}"].value
-        norm_sbd = normalize_sbd(raw_sbd)
+        norm_sbd = normalize_code(raw_sbd)
 
-        if norm_sbd and norm_sbd in ocr_scores:
-            # Chỉ ghi đè giá trị kiểu Float/Number vào đúng ô Điểm (Cột ${scoreCol})
-            ws[f"{SCORE_COL}{row_idx}"].value = float(ocr_scores[norm_sbd])
+        if norm_sbd and norm_sbd in matched_sbd_scores:
+            ws[f"{SCORE_COL}{row_idx}"].value = float(matched_sbd_scores[norm_sbd])
             matched_count += 1
 
     wb.save(output_excel_path)
-    print(f"Hoàn tất! Đã khớp SBD và điền điểm {matched_count} học sinh vào cột {SCORE_COL}.")
+    print(f"Hoàn tất! Đã khớp SBD - Mã Phách và điền điểm {matched_count} học sinh vào cột {SCORE_COL}.")
 
 if __name__ == "__main__":
     update_exam_scores("${fileName}", "Da_Nhap_Diem_${fileName}")
@@ -417,7 +603,7 @@ if __name__ == "__main__":
 
   return {
     updatedExcelBase64,
-    outputFileName: `Da_Nhap_Diem_${fileName || "Bang_Diem_Van_6_THCS_My_Xa.xlsx"}`,
+    outputFileName: `Da_Nhap_Diem_${fileName || "Bang_Diem_Thi_THCS_My_Xa.xlsx"}`,
     matchedCount,
     untouchedCount,
     matchedDetails,
@@ -427,73 +613,71 @@ if __name__ == "__main__":
 }
 
 /**
- * Generates the exact Excel workbook from Hình 2:
- * SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH - TRƯỜNG THCS MỸ XÁ - BẢNG ĐIỂM THI MÔN: VĂN 6
+ * Generates the exact 2-Excel Sample Bundle from the user's screenshots:
+ * - Hình 1: BẢNG ĐIỂM THI MÔN: ANH 9 (K9.001 .. K9.005, Cột G = SBD, Cột I = Điểm)
+ * - Hình 2: PHIẾU CHẤM BÀI THI MÔN TIẾNG ANH 9 (Cột B = SBD, Cột C = MÃ PHÁCH: A40, trống, A41, A42, A43)
  */
-export async function generateSampleExcelClientSide(): Promise<ExcelSheetData> {
-  const wb = new ExcelJS.Workbook();
-  wb.creator = "Trường THCS Mỹ Xá";
-  wb.created = new Date();
-
-  const ws = wb.addWorksheet("Bang_Diem_Van_6", {
+export async function generateSampleAnh9PhachBundleClientSide(): Promise<{
+  rosterExcel: ExcelSheetData;
+  phachExcel: ExcelSheetData;
+}> {
+  // 1. Build Hình 1: BẢNG ĐIỂM THI MÔN: ANH 9
+  const wb1 = new ExcelJS.Workbook();
+  const ws1 = wb1.addWorksheet("Bang_Diem_Anh_9", {
     views: [{ showGridLines: true }],
   });
 
-  ws.columns = [
+  ws1.columns = [
     { key: "stt", width: 6 },        // A: STT
     { key: "hoten", width: 24 },     // B: Họ và tên
-    { key: "ngaysinh", width: 16 },  // C: Ngày sinh
+    { key: "ngaysinh", width: 15 },  // C: Ngày sinh
     { key: "gioi", width: 9 },       // D: Giới
-    { key: "phongthi", width: 10 },  // E: Phòng thi
-    { key: "diadiem", width: 14 },   // F: Địa điểm thi
-    { key: "sbd", width: 16 },       // G: Số BD
+    { key: "phongthi", width: 11 },  // E: Phòng thi
+    { key: "diadiem", width: 12 },   // F: Địa điểm thi
+    { key: "sbd", width: 14 },       // G: SBD
     { key: "made", width: 10 },      // H: Mã đề
     { key: "diem", width: 14 },      // I: Điểm
-    { key: "ghichu", width: 14 },    // J: Ghi chú
+    { key: "ghichu", width: 12 },    // J: Ghi chú
   ];
 
-  // Row 1: SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH
-  ws.mergeCells("A1:D1");
-  ws.getCell("A1").value = "SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH";
-  ws.getCell("A1").font = { name: "Times New Roman", size: 12, bold: false };
-  ws.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
+  ws1.mergeCells("A1:D1");
+  ws1.getCell("A1").value = "SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH";
+  ws1.getCell("A1").font = { name: "Times New Roman", size: 12, bold: false };
+  ws1.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
 
-  // Row 2: TRƯỜNG THCS MỸ XÁ
-  ws.mergeCells("A2:D2");
-  ws.getCell("A2").value = "TRƯỜNG THCS MỸ XÁ";
-  ws.getCell("A2").font = { name: "Times New Roman", size: 12, bold: true };
-  ws.getCell("A2").alignment = { horizontal: "center", vertical: "middle" };
+  ws1.mergeCells("A2:D2");
+  ws1.getCell("A2").value = "TRƯỜNG THCS MỸ XÁ";
+  ws1.getCell("A2").font = { name: "Times New Roman", size: 12, bold: true };
+  ws1.getCell("A2").alignment = { horizontal: "center", vertical: "middle" };
 
-  // Row 3: BẢNG ĐIỂM THI MÔN: VĂN 6
-  ws.mergeCells("A3:J3");
-  ws.getCell("A3").value = "BẢNG ĐIỂM THI MÔN: VĂN 6";
-  ws.getCell("A3").font = { name: "Times New Roman", size: 13, bold: true };
-  ws.getCell("A3").alignment = { horizontal: "center", vertical: "middle" };
-  ws.getRow(3).height = 24;
+  ws1.mergeCells("A3:J3");
+  ws1.getCell("A3").value = "BẢNG ĐIỂM THI MÔN: ANH 9";
+  ws1.getCell("A3").font = { name: "Times New Roman", size: 13, bold: true };
+  ws1.getCell("A3").alignment = { horizontal: "center", vertical: "middle" };
+  ws1.getRow(3).height = 24;
 
-  // Row 5: Table Header matching Hình 2
-  const headerTitles = [
+  const headerTitles1 = [
     "STT",
     "Họ và tên",
     "Ngày sinh",
     "Giới",
     "Phòng thi",
     "Địa điểm thi",
-    "Số BD",
+    "SBD",
     "Mã đề",
     "Điểm",
     "Ghi chú",
   ];
-  const headerRow = ws.getRow(5);
-  headerRow.height = 30;
-  headerTitles.forEach((title, idx) => {
-    const cell = headerRow.getCell(idx + 1);
+  const headerRow1 = ws1.getRow(6);
+  headerRow1.height = 32;
+  headerTitles1.forEach((title, idx) => {
+    const cell = headerRow1.getCell(idx + 1);
     cell.value = title;
     cell.font = { name: "Times New Roman", size: 11, bold: true };
     cell.fill = {
       type: "pattern",
       pattern: "solid",
-      fgColor: { argb: "FFE5E7EB" },
+      fgColor: { argb: "FFEDEDED" },
     };
     cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
     cell.border = {
@@ -504,20 +688,17 @@ export async function generateSampleExcelClientSide(): Promise<ExcelSheetData> {
     };
   });
 
-  // Exact students from Hình 2 (plus K6.006, K6.007 from Hình 1)
-  const sampleStudents = [
-    { stt: 1, hoten: "Đan Trường An", ngaysinh: "20/08/2015", gioi: "Nam", phong: 1, diadiem: "", sbd: "K6.001", made: "", ghichu: "6A4" },
-    { stt: 2, hoten: "Đỗ Huy Khiết An", ngaysinh: "21/05/2015", gioi: "Nam", phong: 1, diadiem: "", sbd: "K6.002", made: "", ghichu: "6A3" },
-    { stt: 3, hoten: "Đỗ Phúc Lâm An", ngaysinh: "14/07/2015", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K6.003", made: "", ghichu: "6A5" },
-    { stt: 4, hoten: "Hoàng An An", ngaysinh: "16/12/2015", gioi: "Nam", phong: 1, diadiem: "", sbd: "K6.004", made: "", ghichu: "6A5" },
-    { stt: 5, hoten: "Hoàng Khánh An", ngaysinh: "17/12/2015", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K6.005", made: "", ghichu: "6A2" },
-    { stt: 6, hoten: "Lê Minh Anh", ngaysinh: "05/03/2015", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K6.006", made: "", ghichu: "6A1" },
-    { stt: 7, hoten: "Nguyễn Tuấn Anh", ngaysinh: "19/09/2015", gioi: "Nam", phong: 1, diadiem: "", sbd: "K6.007", made: "", ghichu: "6A2" },
+  const students1 = [
+    { stt: 1, hoten: "Đinh Thiện An", ngaysinh: "20/10/2012", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K9.001", made: "", ghichu: "9A1" },
+    { stt: 2, hoten: "Phùng Hà An", ngaysinh: "22/05/2012", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K9.002", made: "", ghichu: "9A5" },
+    { stt: 3, hoten: "Trần Khánh An", ngaysinh: "10/01/2012", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K9.003", made: "", ghichu: "9A5" },
+    { stt: 4, hoten: "Trần Ngọc Bảo An", ngaysinh: "02/07/2012", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K9.004", made: "", ghichu: "9A4" },
+    { stt: 5, hoten: "Trịnh Đặng Bảo An", ngaysinh: "25/02/2012", gioi: "Nữ", phong: 1, diadiem: "", sbd: "K9.005", made: "", ghichu: "9A6" },
   ];
 
-  sampleStudents.forEach((student, index) => {
-    const rowNum = 6 + index;
-    const row = ws.getRow(rowNum);
+  students1.forEach((student, index) => {
+    const rowNum = 7 + index;
+    const row = ws1.getRow(rowNum);
     row.height = 24;
     const values = [
       student.stt,
@@ -528,17 +709,13 @@ export async function generateSampleExcelClientSide(): Promise<ExcelSheetData> {
       student.diadiem,
       student.sbd,
       student.made,
-      null, // Cột I: Điểm (Để trống như Hình 2, chờ điền tự động thành Hình 3)
+      null, // Cột I: Điểm (Để trống như Hình 1, sẽ điền thành Hình 4)
       student.ghichu,
     ];
     values.forEach((val, colIdx) => {
       const cell = row.getCell(colIdx + 1);
       cell.value = val;
-      cell.font = {
-        name: "Times New Roman",
-        size: 11,
-        bold: false,
-      };
+      cell.font = { name: "Times New Roman", size: 11, bold: false };
       cell.alignment = {
         horizontal: colIdx === 1 ? "left" : "center",
         vertical: "middle",
@@ -555,13 +732,120 @@ export async function generateSampleExcelClientSide(): Promise<ExcelSheetData> {
     });
   });
 
-  const buffer = await wb.xlsx.writeBuffer();
-  const base64 = arrayBufferToBase64(buffer);
-  return parseExcelClientSide({
-    fileBase64: base64,
-    fileName: "Bang_Diem_Thi_Van_6_THCS_My_Xa.xlsx",
-    preferredHeaderRow: 5,
+  // 2. Build Hình 2: PHIẾU CHẤM BÀI THI - MÔN TIẾNG ANH 9 (Có cột SBD & MÃ PHÁCH)
+  const wb2 = new ExcelJS.Workbook();
+  const ws2 = wb2.addWorksheet("Phieu_Cham_Ma_Phach", {
+    views: [{ showGridLines: true }],
+  });
+
+  ws2.columns = [
+    { key: "stt", width: 8 },         // A: STT
+    { key: "sbd", width: 16 },        // B: SBD
+    { key: "maphach", width: 16 },    // C: MÃ PHÁCH
+    { key: "diemso", width: 20 },     // D: ĐIỂM BẰNG SỐ
+    { key: "diemchu", width: 24 },    // E: ĐIỂM BẰNG CHỮ
+    { key: "ghichu", width: 18 },     // F: GHI CHÚ
+  ];
+
+  ws2.mergeCells("A1:D1");
+  ws2.getCell("A1").value = "SỞ GD&ĐT NINH BÌNH";
+  ws2.getCell("A1").font = { name: "Times New Roman", size: 12, bold: false };
+  ws2.getCell("A1").alignment = { horizontal: "center", vertical: "middle" };
+
+  ws2.getCell("E1").value = "PHIẾU CHẤM BÀI THI";
+  ws2.getCell("E1").font = { name: "Times New Roman", size: 12, bold: true };
+  ws2.getCell("E1").alignment = { horizontal: "center", vertical: "middle" };
+
+  ws2.mergeCells("A2:D2");
+  ws2.getCell("A2").value = "TRƯỜNG THCS MỸ XÁ";
+  ws2.getCell("A2").font = { name: "Times New Roman", size: 12, bold: true, underline: true };
+  ws2.getCell("A2").alignment = { horizontal: "center", vertical: "middle" };
+
+  ws2.getCell("E2").value = "MÔN TIẾNG ANH 9";
+  ws2.getCell("E2").font = { name: "Times New Roman", size: 12, bold: true, underline: true };
+  ws2.getCell("E2").alignment = { horizontal: "center", vertical: "middle" };
+
+  const headerTitles2 = [
+    "STT",
+    "SBD",
+    "MÃ PHÁCH",
+    "ĐIỂM BẰNG SỐ",
+    "ĐIỂM BẰNG CHỮ",
+    "GHI CHÚ",
+  ];
+  const headerRow2 = ws2.getRow(4);
+  headerRow2.height = 28;
+  headerTitles2.forEach((title, idx) => {
+    const cell = headerRow2.getCell(idx + 1);
+    cell.value = title;
+    cell.font = { name: "Times New Roman", size: 11, bold: true };
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFEDEDED" },
+    };
+    cell.alignment = { horizontal: "center", vertical: "middle" };
+    cell.border = {
+      top: { style: "thin", color: { argb: "FF000000" } },
+      bottom: { style: "thin", color: { argb: "FF000000" } },
+      left: { style: "thin", color: { argb: "FF000000" } },
+      right: { style: "thin", color: { argb: "FF000000" } },
+    };
+  });
+
+  const phachRows = [
+    { stt: 1, sbd: "K9.001", maPhach: "A40" },
+    { stt: 2, sbd: "K9.002", maPhach: "" },
+    { stt: 3, sbd: "K9.003", maPhach: "A41" },
+    { stt: 4, sbd: "K9.004", maPhach: "A42" },
+    { stt: 5, sbd: "K9.005", maPhach: "A43" },
+  ];
+
+  phachRows.forEach((item, idx) => {
+    const row = ws2.getRow(5 + idx);
+    row.height = 28;
+    const vals = [item.stt, item.sbd, item.maPhach || null, null, null, null];
+    vals.forEach((v, colIdx) => {
+      const cell = row.getCell(colIdx + 1);
+      cell.value = v;
+      cell.font = { name: "Times New Roman", size: 14, bold: false };
+      cell.alignment = { horizontal: "center", vertical: "middle" };
+      cell.border = {
+        top: { style: "thin", color: { argb: "FF000000" } },
+        bottom: { style: "thin", color: { argb: "FF000000" } },
+        left: { style: "thin", color: { argb: "FF000000" } },
+        right: { style: "thin", color: { argb: "FF000000" } },
+      };
+    });
+  });
+
+  const buf1 = await wb1.xlsx.writeBuffer();
+  const buf2 = await wb2.xlsx.writeBuffer();
+
+  const rosterExcel = await parseExcelClientSide({
+    fileBase64: arrayBufferToBase64(buf1),
+    fileName: "Hinh_1_Bang_Diem_Thi_Anh_9.xlsx",
+    preferredHeaderRow: 6,
     preferredSbdCol: "G",
     preferredScoreCol: "I",
   });
+
+  const phachExcel = await parseExcelClientSide({
+    fileBase64: arrayBufferToBase64(buf2),
+    fileName: "Hinh_2_Bang_Ma_Phach_Anh_9.xlsx",
+    preferredHeaderRow: 4,
+    preferredSbdCol: "B",
+    preferredPhachCol: "C",
+    preferredScoreCol: "D",
+  });
+
+  return { rosterExcel, phachExcel };
+}
+
+/**
+ * Generates the single-Excel sample workbook (Môn Văn 6)
+ */
+export async function generateSampleExcelClientSide(): Promise<ExcelSheetData> {
+  const { rosterExcel } = await generateSampleAnh9PhachBundleClientSide();
+  return rosterExcel;
 }

@@ -6,22 +6,15 @@ import {
   Download,
   CheckCircle2,
   AlertCircle,
-  Code2,
-  Copy,
-  Check,
   Plus,
   Trash2,
   RefreshCw,
-  Search,
   ZoomIn,
   ZoomOut,
   FileCheck2,
-  FileUp,
   ArrowRight,
-  ArrowLeft,
-  Cpu,
-  Keyboard,
-  ClipboardPaste,
+  Link2,
+  Sparkles,
 } from "lucide-react";
 import {
   OcrRecord,
@@ -33,8 +26,9 @@ import {
 } from "./utils/sampleGradingSheet";
 import {
   parseExcelClientSide,
+  detectExcelFileRole,
   exportUpdatedExcelClientSide,
-  generateSampleExcelClientSide,
+  generateSampleAnh9PhachBundleClientSide,
 } from "./utils/clientExcelEngine";
 import {
   runLocalBrowserOcr,
@@ -99,20 +93,29 @@ async function optimizeImageForBatchOcr(
 type OcrEngineMode = "LOCAL_WASM" | "RAPID_KEYBOARD" | "HYBRID_CLOUD";
 
 export default function App() {
-  // Sequential Step Navigation (1: Excel Nguồn -> 2: Quét Ảnh & Điền Điểm Excel)
+  // Sequential Step Navigation (1: Nạp 2 File Excel Nguồn -> 2: Quét PDF/Ảnh & Xuất Excel Hình 4)
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
 
-  // STEP 1: Excel Source File State (100% Client-Side Capable)
+  // STEP 1A: File Excel Nguồn 1 (Hình 1: Bảng Điểm Thí Sinh - có cột SBD & cột Điểm)
   const [excelData, setExcelData] = useState<ExcelSheetData | null>(null);
   const [selectedSheetIndex, setSelectedSheetIndex] = useState<number>(0);
-  const [headerRow, setHeaderRow] = useState<number>(5);
+  const [headerRow, setHeaderRow] = useState<number>(6);
   const [sbdCol, setSbdCol] = useState<string>("G");
   const [scoreCol, setScoreCol] = useState<string>("I");
+
+  // STEP 1B: File Excel Nguồn 2 (Hình 2: Bảng Ghép Mã Phách - có cột SBD & cột MÃ PHÁCH)
+  const [phachExcelData, setPhachExcelData] = useState<ExcelSheetData | null>(null);
+  const [phachSheetIndex, setPhachSheetIndex] = useState<number>(0);
+  const [phachHeaderRow, setPhachHeaderRow] = useState<number>(4);
+  const [phachSbdCol, setPhachSbdCol] = useState<string>("B");
+  const [phachCodeCol, setPhachCodeCol] = useState<string>("C");
+
   const [isExcelLoading, setIsExcelLoading] = useState<boolean>(false);
   const [excelError, setExcelError] = useState<string | null>(null);
-  const [isExcelDragging, setIsExcelDragging] = useState<boolean>(false);
+  const [isExcelDragging1, setIsExcelDragging1] = useState<boolean>(false);
+  const [isExcelDragging2, setIsExcelDragging2] = useState<boolean>(false);
 
-  // STEP 2: Grading Sheet Images & Zero-API / Hybrid OCR State
+  // STEP 2: Grading Sheet PDF/Images (Hình 3) & Hybrid OCR State
   const [engineMode, setEngineMode] = useState<OcrEngineMode>("HYBRID_CLOUD");
   const [images, setImages] = useState<UploadedImage[]>([]);
   const [activeImageIdx, setActiveImageIdx] = useState<number>(0);
@@ -123,16 +126,14 @@ export default function App() {
   const [ocrNotice, setOcrNotice] = useState<string | null>(null);
   const [ocrRecords, setOcrRecords] = useState<OcrRecord[]>([]);
 
-  // Rapid Keyboard Entry & Bulk Paste State (Zero-API Mode)
+  // Rapid Keyboard Entry & Bulk Paste State
   const [rapidInputs, setRapidInputs] = useState<Record<string, string>>({});
   const [activeRapidRowIdx, setActiveRapidRowIdx] = useState<number>(0);
   const [showBulkPaste, setShowBulkPaste] = useState<boolean>(false);
   const [bulkPasteText, setBulkPasteText] = useState<string>("");
   const rapidInputRefs = useRef<Record<number, HTMLInputElement | null>>({});
 
-  // STEP 3: Table Filtering & Export State
-  const [rowFilter, setRowFilter] = useState<"ALL" | "MATCHED" | "UNMATCHED">("ALL");
-  const [searchQuery, setSearchQuery] = useState<string>("");
+  // STEP 3: Export State (Hình 4)
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportResult, setExportResult] = useState<{
     updatedExcelBase64: string;
@@ -142,12 +143,69 @@ export default function App() {
     pythonAuditLog: string;
     openpyxlCode: string;
   } | null>(null);
-  const [copiedCode, setCopiedCode] = useState<boolean>(false);
 
-  const excelInputRef = useRef<HTMLInputElement>(null);
+  const excel1InputRef = useRef<HTMLInputElement>(null);
+  const excel2InputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
 
-  // Extract list of known SBDs from Step 1 Excel file to anchor Local OCR
+  // Build bidirectional SBD <-> MÃ PHÁCH dictionaries from File Excel 2 (Hình 2)
+  const { sbdToPhachMap, phachToSbdMap, totalPhachMappedCount } = useMemo(() => {
+    const s2p: Record<string, string> = {};
+    const p2s: Record<string, string> = {};
+    let count = 0;
+
+    if (!phachExcelData) {
+      return { sbdToPhachMap: s2p, phachToSbdMap: p2s, totalPhachMappedCount: 0 };
+    }
+
+    // First index all cross-sheet pairs if present
+    if (
+      Array.isArray(phachExcelData.allSheetsPhachPairs) &&
+      phachExcelData.allSheetsPhachPairs.length > 0
+    ) {
+      for (const pair of phachExcelData.allSheetsPhachPairs) {
+        const normSbd = normalizeSbdClient(pair.sbd);
+        const canonSbd = canonicalSbdKey(pair.sbd);
+        const normPhach = normalizeSbdClient(pair.maPhach);
+        const canonPhach = canonicalSbdKey(pair.maPhach);
+
+        if (normSbd && normPhach) {
+          s2p[normSbd] = normPhach;
+          if (canonSbd) s2p[canonSbd] = normPhach;
+          p2s[normPhach] = normSbd;
+          if (canonPhach) p2s[canonPhach] = normSbd;
+        }
+      }
+    }
+
+    // Override/ensure current sheet's selected columns (phachSbdCol & phachCodeCol) are indexed accurately
+    for (const row of phachExcelData.studentRows) {
+      const rawSbd = row.cells[phachSbdCol] ?? row.sbd;
+      const rawPhach = row.cells[phachCodeCol] ?? row.maPhach;
+      const normSbd = normalizeSbdClient(rawSbd);
+      const canonSbd = canonicalSbdKey(rawSbd);
+      const normPhach = normalizeSbdClient(rawPhach);
+      const canonPhach = canonicalSbdKey(rawPhach);
+
+      if (normSbd) {
+        s2p[normSbd] = normPhach || "";
+        if (canonSbd) s2p[canonSbd] = normPhach || "";
+      }
+      if (normSbd && normPhach) {
+        p2s[normPhach] = normSbd;
+        if (canonPhach) p2s[canonPhach] = normSbd;
+        count++;
+      }
+    }
+
+    return {
+      sbdToPhachMap: s2p,
+      phachToSbdMap: p2s,
+      totalPhachMappedCount: count,
+    };
+  }, [phachExcelData, phachSbdCol, phachCodeCol]);
+
+  // Extract list of known SBDs from File Excel 1 (Hình 1)
   const knownSbds = useMemo(() => {
     if (!excelData) return [];
     return excelData.studentRows
@@ -155,55 +213,95 @@ export default function App() {
       .filter(Boolean);
   }, [excelData, sbdCol]);
 
-  // Lookup map for fast VLOOKUP matching (indexes both normalized and dotless canonical keys)
+  // Dynamically resolve each OCR record through phachToSbdMap & sbdToPhachMap
+  // so whether the grading sheet (Hình 3) has MÃ PHÁCH (A40, A41...) or SBD (K9.001...),
+  // both `resolvedSbd` and `resolvedPhach` are always populated!
+  const resolvedOcrRecords = useMemo(() => {
+    return ocrRecords.map((rec) => {
+      const normCode = normalizeSbdClient(rec.sbd);
+      const canonCode = canonicalSbdKey(rec.sbd);
+      const normExplicitPhach = normalizeSbdClient(rec.maPhach || "");
+      const canonExplicitPhach = canonicalSbdKey(rec.maPhach || "");
+
+      let finalSbd = normCode;
+      let finalPhach = normExplicitPhach;
+
+      // Case 1: The code in rec.sbd is actually a MÃ PHÁCH in phachToSbdMap (e.g., "A40" -> "K9.001")
+      if (phachToSbdMap[normCode] || phachToSbdMap[canonCode]) {
+        finalPhach = normCode;
+        finalSbd = phachToSbdMap[normCode] || phachToSbdMap[canonCode];
+      } else if (
+        normExplicitPhach &&
+        (phachToSbdMap[normExplicitPhach] || phachToSbdMap[canonExplicitPhach])
+      ) {
+        // Case 2: rec.maPhach is in phachToSbdMap
+        finalSbd =
+          phachToSbdMap[normExplicitPhach] || phachToSbdMap[canonExplicitPhach];
+      } else if (sbdToPhachMap[normCode] || sbdToPhachMap[canonCode]) {
+        // Case 3: rec.sbd is already an SBD (e.g. "K9.001"), look up its Mã Phách ("A40")
+        finalPhach = sbdToPhachMap[normCode] || sbdToPhachMap[canonCode];
+      }
+
+      return {
+        ...rec,
+        resolvedSbd: finalSbd,
+        resolvedPhach: finalPhach,
+      };
+    });
+  }, [ocrRecords, phachToSbdMap, sbdToPhachMap]);
+
+  // Lookup map for fast 3-way VLOOKUP matching (indexes by SBD, canonical SBD, Mã Phách, and canonical Mã Phách)
   const ocrLookupMap = useMemo(() => {
-    const map = new Map<string, OcrRecord>();
-    for (const rec of ocrRecords) {
-      const norm = normalizeSbdClient(rec.sbd);
-      const canon = canonicalSbdKey(rec.sbd);
-      if (norm) map.set(norm, rec);
-      if (canon) map.set(canon, rec);
+    const map = new Map<string, (typeof resolvedOcrRecords)[number]>();
+    for (const rec of resolvedOcrRecords) {
+      const normS = normalizeSbdClient(rec.resolvedSbd);
+      const canonS = canonicalSbdKey(rec.resolvedSbd);
+      if (normS) map.set(normS, rec);
+      if (canonS) map.set(canonS, rec);
+
+      if (rec.resolvedPhach) {
+        const normP = normalizeSbdClient(rec.resolvedPhach);
+        const canonP = canonicalSbdKey(rec.resolvedPhach);
+        if (normP) map.set(normP, rec);
+        if (canonP) map.set(canonP, rec);
+      }
     }
     return map;
-  }, [ocrRecords]);
+  }, [resolvedOcrRecords]);
 
-  // Match Excel student rows with OCR results
+  // Match File Excel 1 (Hình 1) student rows with File Excel 2 (Hình 2 Mã Phách) & Hình 3 OCR Scores -> Hình 4!
   const matchedStudentRows = useMemo(() => {
     if (!excelData) return [];
     return excelData.studentRows.map((row) => {
       const rawSbd = row.cells[sbdCol] ?? row.sbd;
       const normSbd = normalizeSbdClient(rawSbd);
       const canonSbd = canonicalSbdKey(rawSbd);
+
+      const linkedPhach =
+        (normSbd ? sbdToPhachMap[normSbd] : undefined) ??
+        (canonSbd ? sbdToPhachMap[canonSbd] : undefined) ??
+        "";
+      const normPhach = normalizeSbdClient(linkedPhach);
+      const canonPhach = canonicalSbdKey(linkedPhach);
+
       const matchedOcr =
         (normSbd ? ocrLookupMap.get(normSbd) : undefined) ||
-        (canonSbd ? ocrLookupMap.get(canonSbd) : undefined);
+        (canonSbd ? ocrLookupMap.get(canonSbd) : undefined) ||
+        (normPhach ? ocrLookupMap.get(normPhach) : undefined) ||
+        (canonPhach ? ocrLookupMap.get(canonPhach) : undefined);
+
       return {
         ...row,
         displaySbd: rawSbd !== null && rawSbd !== undefined ? String(rawSbd) : "",
         normalizedSbd: normSbd,
+        linkedPhach,
         matchedScore: matchedOcr ? matchedOcr.score : null,
         matchedRawText: matchedOcr ? matchedOcr.rawScoreText : null,
         matchedSource: matchedOcr ? matchedOcr.sourceImage : null,
         isMatched: Boolean(matchedOcr),
       };
     });
-  }, [excelData, sbdCol, ocrLookupMap]);
-
-  const filteredStudentRows = useMemo(() => {
-    return matchedStudentRows.filter((r) => {
-      if (rowFilter === "MATCHED" && !r.isMatched) return false;
-      if (rowFilter === "UNMATCHED" && r.isMatched) return false;
-      if (searchQuery.trim()) {
-        const q = searchQuery.trim().toLowerCase();
-        const rowText = Object.values(r.cells)
-          .map((v) => String(v ?? ""))
-          .join(" ")
-          .toLowerCase();
-        return rowText.includes(q) || r.displaySbd.toLowerCase().includes(q);
-      }
-      return true;
-    });
-  }, [matchedStudentRows, rowFilter, searchQuery]);
+  }, [excelData, sbdCol, sbdToPhachMap, ocrLookupMap]);
 
   const stats = useMemo(() => {
     const totalExcelStudents = matchedStudentRows.length;
@@ -217,96 +315,109 @@ export default function App() {
     };
   }, [matchedStudentRows, ocrRecords]);
 
-  // Openpyxl Python code preview
-  const liveOpenpyxlScript = useMemo(() => {
-    if (exportResult?.openpyxlCode) return exportResult.openpyxlCode;
-    const fileName = excelData?.fileName || "Danh_Sach_Hoc_Sinh.xlsx";
-    const startRow = headerRow + 1;
-    const dictLines = ocrRecords
-      .map(
-        (r) =>
-          `    "${normalizeSbdClient(r.sbd)}": ${r.score},  # Gốc trên phiếu: "${r.rawScoreText}"`
-      )
-      .join("\n");
-
-    return `import re
-import openpyxl
-
-def normalize_sbd(value) -> str:
-    """Chuẩn hóa SBD (loại bỏ khoảng trắng thừa, viết hoa)."""
-    if value is None:
-        return ""
-    return re.sub(r"\\s+", "", str(value).strip()).replace(",", ".").upper()
-
-def sync_scores_to_excel(excel_path: str, output_path: str):
-    # BƯỚC 1: Mở file Excel nguồn "${fileName}", bảo toàn 100% định dạng gốc
-    wb = openpyxl.load_workbook(excel_path, data_only=False)
-    sheet_names = wb.sheetnames
-    ws = wb[sheet_names[${selectedSheetIndex}]] if len(sheet_names) > ${selectedSheetIndex} else wb.active
-
-    HEADER_ROW = ${headerRow}
-    START_DATA_ROW = ${startRow}
-    SBD_COL = "${sbdCol}"
-    SCORE_COL = "${scoreCol}"
-
-    # BƯỚC 2: Dữ liệu (SBD -> Điểm số Float) đã trích xuất từ PHIẾU CHẤM BÀI THI
-    ocr_scores: dict[str, float] = {
-${dictLines || "    # Dữ liệu điểm từ Phiếu Chấm Bài Thi"}
-    }
-
-    updated_count = 0
-
-    # BƯỚC 3: Quét cột ${sbdCol} từ hàng ${startRow} và ghi điểm Float vào cột ${scoreCol}
-    for row_idx in range(START_DATA_ROW, ws.max_row + 1):
-        raw_sbd = ws[f"{SBD_COL}{row_idx}"].value
-        norm_sbd = normalize_sbd(raw_sbd)
-
-        if norm_sbd and norm_sbd in ocr_scores:
-            # Ghi đè duy nhất giá trị điểm dạng số thực (Float)
-            ws[f"{SCORE_COL}{row_idx}"].value = float(ocr_scores[norm_sbd])
-            updated_count += 1
-
-    wb.save(output_path)
-    print(f"Hoàn tất! Đã điền điểm {updated_count} học sinh vào file: {output_path}")
-
-if __name__ == "__main__":
-    sync_scores_to_excel("${fileName}", "Da_Nhap_Diem_${fileName}")`;
-  }, [exportResult, excelData, selectedSheetIndex, headerRow, sbdCol, scoreCol, ocrRecords]);
-
   // ============================================================================
-  // STEP 1 HANDLERS: 100% Client-Side Excel Parsing (Works on Vercel & Offline)
+  // STEP 1 HANDLERS: Load File Excel 1 (Hình 1) & File Excel 2 (Hình 2)
   // ============================================================================
-  const parseAndLoadExcelBuffer = async (
+  const readBlobAsBase64 = (file: File | Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+  const loadRosterExcelFile = async (
     file: File | Blob,
     fileName: string,
     sheetIndex = 0
   ) => {
+    const base64 = await readBlobAsBase64(file);
+    const parsed = await parseExcelClientSide({
+      fileBase64: base64,
+      fileName,
+      targetSheetIndex: sheetIndex,
+    });
+    setExcelData(parsed);
+    setSelectedSheetIndex(sheetIndex);
+    setHeaderRow(parsed.detectedHeaderRow || 6);
+    setSbdCol(parsed.detectedSbdCol || "G");
+    setScoreCol(parsed.detectedScoreCol || "I");
+    setExportResult(null);
+  };
+
+  const loadPhachExcelFile = async (
+    file: File | Blob,
+    fileName: string,
+    sheetIndex = 0
+  ) => {
+    const base64 = await readBlobAsBase64(file);
+    const parsed = await parseExcelClientSide({
+      fileBase64: base64,
+      fileName,
+      targetSheetIndex: sheetIndex,
+    });
+    setPhachExcelData(parsed);
+    setPhachSheetIndex(sheetIndex);
+    setPhachHeaderRow(parsed.detectedHeaderRow || 4);
+    setPhachSbdCol(parsed.detectedSbdCol || "B");
+    setPhachCodeCol(parsed.detectedPhachCol || "C");
+    setExportResult(null);
+  };
+
+  /**
+   * Handles uploading 1 or 2 Excel files at once.
+   * If 2 files are selected simultaneously, automatically assigns the one with "MÃ PHÁCH" to Hình 2
+   * and the student roster to Hình 1!
+   */
+  const handleSmartExcelFilesUpload = async (
+    fileList: FileList | File[],
+    targetSlot: "SLOT_1_ROSTER" | "SLOT_2_PHACH"
+  ) => {
+    const files = Array.from(fileList).filter(
+      (f) => f.name.endsWith(".xlsx") || f.name.endsWith(".xls")
+    );
+    if (files.length === 0) {
+      setExcelError("Vui lòng chọn file Excel có định dạng .xlsx.");
+      return;
+    }
+
     setIsExcelLoading(true);
     setExcelError(null);
 
     try {
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result));
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-
-      const parsed = await parseExcelClientSide({
-        fileBase64: base64,
-        fileName,
-        targetSheetIndex: sheetIndex,
-      });
-
-      setExcelData(parsed);
-      setSelectedSheetIndex(sheetIndex);
-      setHeaderRow(parsed.detectedHeaderRow || 5);
-      setSbdCol(parsed.detectedSbdCol || "G");
-      setScoreCol(parsed.detectedScoreCol || "I");
-      setExportResult(null);
-
-      // Move to Step 2 automatically after loading Source Excel file
-      setCurrentStep(2);
+      if (files.length >= 2) {
+        // User selected both Excel files at once! Automatically classify Hình 1 vs Hình 2
+        for (const f of files) {
+          const base64 = await readBlobAsBase64(f);
+          const parsed = await parseExcelClientSide({
+            fileBase64: base64,
+            fileName: f.name,
+            targetSheetIndex: 0,
+          });
+          const role = detectExcelFileRole(parsed);
+          if (role === "PHACH_MAP") {
+            setPhachExcelData(parsed);
+            setPhachSheetIndex(0);
+            setPhachHeaderRow(parsed.detectedHeaderRow || 4);
+            setPhachSbdCol(parsed.detectedSbdCol || "B");
+            setPhachCodeCol(parsed.detectedPhachCol || "C");
+          } else {
+            setExcelData(parsed);
+            setSelectedSheetIndex(0);
+            setHeaderRow(parsed.detectedHeaderRow || 6);
+            setSbdCol(parsed.detectedSbdCol || "G");
+            setScoreCol(parsed.detectedScoreCol || "I");
+          }
+        }
+        setExportResult(null);
+      } else {
+        const singleFile = files[0];
+        if (targetSlot === "SLOT_2_PHACH") {
+          await loadPhachExcelFile(singleFile, singleFile.name, 0);
+        } else {
+          await loadRosterExcelFile(singleFile, singleFile.name, 0);
+        }
+      }
     } catch (err: any) {
       setExcelError(
         err?.message ||
@@ -314,29 +425,12 @@ if __name__ == "__main__":
       );
     } finally {
       setIsExcelLoading(false);
-      if (excelInputRef.current) excelInputRef.current.value = "";
+      if (excel1InputRef.current) excel1InputRef.current.value = "";
+      if (excel2InputRef.current) excel2InputRef.current.value = "";
     }
   };
 
-  const handleExcelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await parseAndLoadExcelBuffer(file, file.name, 0);
-  };
-
-  const handleExcelDrop = async (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setIsExcelDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (!file) return;
-    if (!file.name.endsWith(".xlsx") && !file.name.endsWith(".xls")) {
-      setExcelError("Vui lòng tải lên file Excel có định dạng .xlsx.");
-      return;
-    }
-    await parseAndLoadExcelBuffer(file, file.name, 0);
-  };
-
-  const handleSheetChange = async (newSheetIdx: number) => {
+  const handleSheetChange1 = async (newSheetIdx: number) => {
     if (!excelData) return;
     setSelectedSheetIndex(newSheetIdx);
     setIsExcelLoading(true);
@@ -347,7 +441,7 @@ if __name__ == "__main__":
         targetSheetIndex: newSheetIdx,
       });
       setExcelData(parsed);
-      setHeaderRow(parsed.detectedHeaderRow || 5);
+      setHeaderRow(parsed.detectedHeaderRow || 6);
       setSbdCol(parsed.detectedSbdCol || "G");
       setScoreCol(parsed.detectedScoreCol || "I");
     } catch (err: any) {
@@ -357,7 +451,7 @@ if __name__ == "__main__":
     }
   };
 
-  const handleHeaderRowChange = async (newHeaderRow: number) => {
+  const handleHeaderRowChange1 = async (newHeaderRow: number) => {
     setHeaderRow(newHeaderRow);
     if (!excelData) return;
     try {
@@ -375,82 +469,165 @@ if __name__ == "__main__":
     }
   };
 
-  // Load Sample Bundle (Hình 2 Excel + Hình 1 Grading Sheet -> Matched Hình 3)
-  const handleLoadSampleWorkspace = async () => {
+  const handleSheetChange2 = async (newSheetIdx: number) => {
+    if (!phachExcelData) return;
+    setPhachSheetIndex(newSheetIdx);
+    setIsExcelLoading(true);
+    try {
+      const parsed = await parseExcelClientSide({
+        fileBase64: phachExcelData.fileBase64,
+        fileName: phachExcelData.fileName,
+        targetSheetIndex: newSheetIdx,
+      });
+      setPhachExcelData(parsed);
+      setPhachHeaderRow(parsed.detectedHeaderRow || 4);
+      setPhachSbdCol(parsed.detectedSbdCol || "B");
+      setPhachCodeCol(parsed.detectedPhachCol || "C");
+    } catch (err: any) {
+      setExcelError(err?.message || "Không thể chuyển trang tính File 2.");
+    } finally {
+      setIsExcelLoading(false);
+    }
+  };
+
+  const handleHeaderRowChange2 = async (newHeaderRow: number) => {
+    setPhachHeaderRow(newHeaderRow);
+    if (!phachExcelData) return;
+    try {
+      const parsed = await parseExcelClientSide({
+        fileBase64: phachExcelData.fileBase64,
+        fileName: phachExcelData.fileName,
+        preferredHeaderRow: newHeaderRow,
+        preferredSbdCol: phachSbdCol,
+        preferredPhachCol: phachCodeCol,
+        targetSheetIndex: phachSheetIndex,
+      });
+      setPhachExcelData(parsed);
+    } catch {
+      // Keep current state
+    }
+  };
+
+  // Load Sample Workspace: Hình 1 (Bảng điểm Anh 9) + Hình 2 (Bảng Mã Phách) + Hình 3 (Phiếu chấm Mã Phách) -> Hình 4
+  const handleLoadSamplePhachWorkspace = async () => {
     setIsExcelLoading(true);
     setOcrNotice(null);
     setExcelError(null);
 
     try {
-      // 1. Load Hình 2: Trường THCS Mỹ Xá - Bảng Điểm Thi Môn: Văn 6 (K6.001..K6.005)
-      const sampleExcel = await generateSampleExcelClientSide();
-      setExcelData(sampleExcel);
-      setSelectedSheetIndex(0);
-      setHeaderRow(sampleExcel.detectedHeaderRow || 5);
-      setSbdCol(sampleExcel.detectedSbdCol || "G");
-      setScoreCol(sampleExcel.detectedScoreCol || "I");
+      const { rosterExcel, phachExcel } =
+        await generateSampleAnh9PhachBundleClientSide();
 
-      // 2. Load Hình 1: Actual uploaded grading sheet photo (/assets/aistudio/image_74b23c14.png)
+      setExcelData(rosterExcel);
+      setSelectedSheetIndex(0);
+      setHeaderRow(rosterExcel.detectedHeaderRow || 6);
+      setSbdCol(rosterExcel.detectedSbdCol || "G");
+      setScoreCol(rosterExcel.detectedScoreCol || "I");
+
+      setPhachExcelData(phachExcel);
+      setPhachSheetIndex(0);
+      setPhachHeaderRow(phachExcel.detectedHeaderRow || 4);
+      setPhachSbdCol(phachExcel.detectedSbdCol || "B");
+      setPhachCodeCol(phachExcel.detectedPhachCol || "C");
+
+      // Build phachToSbdMap from sample phachExcel
+      const sampleP2S: Record<string, string> = {};
+      for (const r of phachExcel.studentRows) {
+        const s = normalizeSbdClient(r.sbd);
+        const p = normalizeSbdClient(r.maPhach);
+        if (s && p) {
+          sampleP2S[p] = s;
+        }
+      }
+
+      // Load Hình 3 (/assets/aistudio/image_a4899c97.png)
       let dataUrl = "";
       try {
-        const resp = await fetch("/assets/aistudio/image_74b23c14.png");
+        const resp = await fetch("/assets/aistudio/image_a4899c97.png");
         if (resp.ok) {
           const blob = await resp.blob();
-          dataUrl = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result));
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-          });
+          dataUrl = await readBlobAsBase64(blob);
         }
       } catch {
-        // Fallback to generated canvas if static asset is unavailable
+        // fallback
       }
       if (!dataUrl) {
         dataUrl = generateSampleGradingSheetImage().dataUrl;
       }
 
       const sampleImageObj: UploadedImage = {
-        id: `hinh1-${Date.now()}`,
-        name: "Hinh_1_Phieu_Cham_Van6.png",
+        id: `hinh3-${Date.now()}`,
+        name: "Hinh_3_Phieu_Cham_Ma_Phach_Anh_9.png",
         mimeType: "image/png",
         dataUrl,
       };
       setImages([sampleImageObj]);
       setActiveImageIdx(0);
 
-      const sbdsFromSample = sampleExcel.studentRows
+      const sbdsFromSample = rosterExcel.studentRows
         .map((r) => normalizeSbdClient(r.cells["G"] ?? r.sbd))
         .filter(Boolean);
 
       setCurrentStep(2);
-      await executeOcrPipeline([sampleImageObj], sbdsFromSample, false);
+      await executeOcrPipeline(
+        [sampleImageObj],
+        sbdsFromSample,
+        sampleP2S,
+        false
+      );
     } catch (err: any) {
-      setExcelError(err?.message || "Lỗi khi khởi tạo dữ liệu mẫu.");
+      setExcelError(err?.message || "Lỗi khi khởi tạo bộ dữ liệu mẫu.");
     } finally {
       setIsExcelLoading(false);
     }
   };
 
   // ============================================================================
-  // STEP 2 HANDLERS: Local WebAssembly OCR / Rapid Keyboard / Cloud Fallback
+  // STEP 2 HANDLERS: Hybrid Cloud OCR / Local OCR / Rapid Keyboard
   // ============================================================================
-  const mergeIncomingRecords = (incoming: OcrRecord[], append: boolean) => {
+  const mergeIncomingRecords = (
+    incoming: OcrRecord[],
+    activePhachMap: Record<string, string>,
+    append: boolean
+  ) => {
     setOcrRecords((prev) => {
       const combined = append ? [...prev, ...incoming] : incoming;
-      const bySbd = new Map<string, OcrRecord>();
+      const byKey = new Map<string, OcrRecord>();
+
       for (const item of combined) {
-        const key = canonicalSbdKey(item.sbd) || normalizeSbdClient(item.sbd);
+        const rawCode = normalizeSbdClient(item.sbd);
+        const canonCode = canonicalSbdKey(item.sbd);
+        const rawPhach = normalizeSbdClient(item.maPhach || "");
+        const canonPhach = canonicalSbdKey(item.maPhach || "");
+
+        let mappedSbd = rawCode;
+        let mappedPhach = rawPhach;
+
+        if (activePhachMap[rawCode] || activePhachMap[canonCode]) {
+          mappedPhach = rawCode;
+          mappedSbd = activePhachMap[rawCode] || activePhachMap[canonCode];
+        } else if (
+          rawPhach &&
+          (activePhachMap[rawPhach] || activePhachMap[canonPhach])
+        ) {
+          mappedSbd = activePhachMap[rawPhach] || activePhachMap[canonPhach];
+        }
+
+        const key =
+          canonicalSbdKey(mappedSbd) ||
+          normalizeSbdClient(mappedSbd) ||
+          canonicalSbdKey(mappedPhach);
+
         if (key) {
-          bySbd.set(key, {
+          byKey.set(key, {
             ...item,
-            sbd: normalizeSbdClient(item.sbd),
+            sbd: mappedSbd,
+            maPhach: mappedPhach || item.maPhach,
           });
         }
       }
-      const nextList = Array.from(bySbd.values());
 
-      // Sync rapid keyboard inputs map as well
+      const nextList = Array.from(byKey.values());
       const nextRapid: Record<string, string> = {};
       for (const r of nextList) {
         nextRapid[normalizeSbdClient(r.sbd)] = r.rawScoreText;
@@ -464,13 +641,14 @@ if __name__ == "__main__":
   const executeOcrPipeline = async (
     targetImages: UploadedImage[],
     activeKnownSbds: string[],
+    activePhachToSbdMap: Record<string, string>,
     append = false
   ) => {
     if (targetImages.length === 0) return;
 
     if (engineMode === "RAPID_KEYBOARD") {
       setOcrNotice(
-        "Đang ở Chế độ Nhập Nhanh Bàn Phím (Không cần API): Gõ điểm (VD: 8,5) và nhấn Enter để xuống dòng tức thì."
+        "Đang ở Chế độ Nhập Nhanh Bàn Phím: Gõ điểm (VD: 8,5) và nhấn Enter để xuống dòng tức thì."
       );
       return;
     }
@@ -487,14 +665,16 @@ if __name__ == "__main__":
     const totalFiles = targetImages.length;
     let missingCloudKeyMessage: string | null = null;
 
+    // Combine known SBDs and known Mã Phách codes so OCR knows all valid identifiers
+    const combinedKnownCodes = Array.from(
+      new Set([...activeKnownSbds, ...Object.keys(activePhachToSbdMap)])
+    );
+
     try {
-      // Process each image sequentially in a fault-tolerant batch queue (1..13+)
-      // so each sheet streams into the table immediately and never triggers 413/timeout!
       for (let idx = 0; idx < totalFiles; idx++) {
         const currentImg = targetImages[idx];
         const basePct = Math.round((idx / totalFiles) * 100);
 
-        // Mark this image tab as PROCESSING and focus it so the user sees live progress
         setImages((prev) =>
           prev.map((item) =>
             item.id === currentImg.id ? { ...item, status: "PROCESSING" } : item
@@ -516,6 +696,7 @@ if __name__ == "__main__":
           sheetRecords = await runLocalBrowserOcr({
             images: [currentImg],
             knownSbds: activeKnownSbds,
+            phachToSbdMap: activePhachToSbdMap,
             onProgress: (text, subPct) => {
               const overallPct = Math.min(
                 99,
@@ -526,7 +707,6 @@ if __name__ == "__main__":
             },
           });
         } else {
-          // HYBRID_CLOUD: Call /api/ocr per single compressed image with up to 3 retries before Local OCR fallback
           let cloudSuccess = false;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
@@ -534,7 +714,8 @@ if __name__ == "__main__":
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  knownSbds: activeKnownSbds,
+                  knownSbds: combinedKnownCodes,
+                  phachToSbdMap: activePhachToSbdMap,
                   images: [
                     {
                       name: currentImg.name,
@@ -581,10 +762,10 @@ if __name__ == "__main__":
           }
 
           if (!cloudSuccess) {
-            // Automatic per-image fallback to Local Browser OCR if cloud is unreachable
             sheetRecords = await runLocalBrowserOcr({
               images: [currentImg],
               knownSbds: activeKnownSbds,
+              phachToSbdMap: activePhachToSbdMap,
               onProgress: (text, subPct) => {
                 const overallPct = Math.min(
                   99,
@@ -601,12 +782,10 @@ if __name__ == "__main__":
 
         totalExtractedAcrossBatch += sheetRecords.length;
 
-        // Immediately stream this sheet's extracted scores into the live table & Hình 3 preview!
         if (sheetRecords.length > 0) {
-          mergeIncomingRecords(sheetRecords, true);
+          mergeIncomingRecords(sheetRecords, activePhachToSbdMap, true);
         }
 
-        // Mark this image tab as DONE with extracted count
         setImages((prev) =>
           prev.map((item) =>
             item.id === currentImg.id
@@ -625,8 +804,12 @@ if __name__ == "__main__":
       if (missingCloudKeyMessage) {
         setOcrNotice(missingCloudKeyMessage);
       } else {
+        const phachNote =
+          Object.keys(activePhachToSbdMap).length > 0
+            ? ` và tự động quy chiếu cột MÃ PHÁCH → SBD`
+            : "";
         setOcrNotice(
-          `Đã quét hoàn tất ${totalFiles} phiếu chấm và trích xuất tổng cộng ${totalExtractedAcrossBatch} dòng điểm.`
+          `Đã quét hoàn tất ${totalFiles} trang phiếu chấm, trích xuất ${totalExtractedAcrossBatch} dòng điểm${phachNote}.`
         );
       }
     } catch (err: any) {
@@ -701,20 +884,26 @@ if __name__ == "__main__":
     setActiveImageIdx(updatedList.length - newImages.length);
 
     if (engineMode !== "RAPID_KEYBOARD") {
-      await executeOcrPipeline(newImages, knownSbds, true);
+      await executeOcrPipeline(newImages, knownSbds, phachToSbdMap, true);
     }
     if (imageInputRef.current) imageInputRef.current.value = "";
   };
 
-  // Rapid Keyboard Entry Handler: Type "8,5" -> automatically saves 8.5 for that student's SBD
-  const handleRapidScoreChange = (studentSbd: string, rawVal: string) => {
+  // Rapid Keyboard Entry Handler
+  const handleRapidScoreChange = (
+    studentSbd: string,
+    linkedPhach: string,
+    rawVal: string
+  ) => {
     const normSbd = normalizeSbdClient(studentSbd);
     if (!normSbd) return;
 
     setRapidInputs((prev) => ({ ...prev, [normSbd]: rawVal }));
 
     if (!rawVal.trim()) {
-      setOcrRecords((prev) => prev.filter((r) => normalizeSbdClient(r.sbd) !== normSbd));
+      setOcrRecords((prev) =>
+        prev.filter((r) => normalizeSbdClient(r.sbd) !== normSbd)
+      );
       setExportResult(null);
       return;
     }
@@ -729,9 +918,12 @@ if __name__ == "__main__":
           normalizeSbdClient(r.sbd) === normSbd
             ? {
                 ...r,
+                maPhach: linkedPhach || r.maPhach,
                 rawScoreText: rawVal,
                 score: parsedScore,
-                notes: `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
+                notes: linkedPhach
+                  ? `Mã phách ${linkedPhach} → SBD ${normSbd}: "${rawVal}" → ${parsedScore}`
+                  : `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
               }
             : r
         );
@@ -742,12 +934,15 @@ if __name__ == "__main__":
           id: `rapid-${normSbd}-${Date.now()}`,
           sbd: normSbd,
           rawSbd: studentSbd,
+          maPhach: linkedPhach || undefined,
           score: parsedScore,
           rawScoreText: rawVal,
           scoreInWords: "",
           confidence: "CAO",
-          notes: `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
-          sourceImage: "Nhập nhanh bàn phím (Zero-API)",
+          notes: linkedPhach
+            ? `Mã phách ${linkedPhach} → SBD ${normSbd}: "${rawVal}" → ${parsedScore}`
+            : `Nhập nhanh: "${rawVal}" → ${parsedScore}`,
+          sourceImage: "Nhập nhanh bàn phím",
         },
       ];
     });
@@ -776,20 +971,32 @@ if __name__ == "__main__":
 
   const handleApplyBulkPaste = () => {
     if (!bulkPasteText.trim()) return;
-    const parsed = parseBulkPastedScores(bulkPasteText, knownSbds);
+    const parsed = parseBulkPastedScores(
+      bulkPasteText,
+      knownSbds,
+      phachToSbdMap
+    );
     if (parsed.length > 0) {
-      mergeIncomingRecords(parsed, true);
-      setOcrNotice(`Đã dán và chuẩn hóa thành công ${parsed.length} dòng điểm (Không cần API).`);
+      mergeIncomingRecords(parsed, phachToSbdMap, true);
+      setOcrNotice(
+        `Đã dán và chuẩn hóa thành công ${parsed.length} dòng điểm.`
+      );
       setShowBulkPaste(false);
       setBulkPasteText("");
     }
   };
 
   // ============================================================================
-  // STEP 3 HANDLERS: 100% Client-Side Excel Export (Preserves Formatting)
+  // STEP 3 HANDLERS: 100% Client-Side Excel Export (Produces Hình 4)
   // ============================================================================
-  const triggerBase64Download = (base64Data: string, fileName: string, mimeType: string) => {
-    const clean = base64Data.includes(",") ? base64Data.split(",")[1] : base64Data;
+  const triggerBase64Download = (
+    base64Data: string,
+    fileName: string,
+    mimeType: string
+  ) => {
+    const clean = base64Data.includes(",")
+      ? base64Data.split(",")[1]
+      : base64Data;
     const byteCharacters = atob(clean);
     const byteNumbers = new Array(byteCharacters.length);
     for (let i = 0; i < byteCharacters.length; i++) {
@@ -809,7 +1016,7 @@ if __name__ == "__main__":
 
   const handleExecuteAndExport = async () => {
     if (!excelData) {
-      setExcelError("Vui lòng tải lên file Excel nguồn ở Bước 1 trước.");
+      setExcelError("Vui lòng tải lên File Excel Nguồn 1 (Bảng điểm SBD) ở Bước 1 trước.");
       setCurrentStep(1);
       return;
     }
@@ -817,7 +1024,6 @@ if __name__ == "__main__":
     setExcelError(null);
 
     try {
-      // Runs 100% in the browser using ExcelJS — works on Vercel, GitHub Pages, and offline!
       const result = await exportUpdatedExcelClientSide({
         fileBase64: excelData.fileBase64,
         fileName: excelData.fileName,
@@ -825,10 +1031,13 @@ if __name__ == "__main__":
         sbdCol,
         scoreCol,
         sheetIndex: selectedSheetIndex,
-        ocrRecords: ocrRecords.map((r) => ({
-          sbd: normalizeSbdClient(r.sbd),
+        ocrRecords: resolvedOcrRecords.map((r) => ({
+          sbd: normalizeSbdClient(r.resolvedSbd),
+          maPhach: r.resolvedPhach || undefined,
           score: r.score,
         })),
+        sbdToPhachMap,
+        phachToSbdMap,
       });
 
       setExportResult(result);
@@ -844,30 +1053,49 @@ if __name__ == "__main__":
     }
   };
 
-  const handleDownloadPythonScript = () => {
-    const blob = new Blob([liveOpenpyxlScript], { type: "text/x-python;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "auto_update_scores_openpyxl.py";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  const handleCopyCode = () => {
-    navigator.clipboard.writeText(liveOpenpyxlScript);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
-  };
-
-  const handleUpdateOcrRow = (id: string, field: "sbd" | "rawScoreText", value: string) => {
+  const handleUpdateOcrRow = (
+    id: string,
+    field: "sbd" | "maPhach" | "rawScoreText",
+    value: string
+  ) => {
     setOcrRecords((prev) =>
       prev.map((rec) => {
         if (rec.id !== id) return rec;
+        if (field === "maPhach") {
+          const normP = normalizeSbdClient(value);
+          const canonP = canonicalSbdKey(value);
+          const mappedSbd =
+            phachToSbdMap[normP] || phachToSbdMap[canonP] || rec.sbd;
+          return {
+            ...rec,
+            maPhach: value,
+            sbd: mappedSbd,
+            notes:
+              mappedSbd && mappedSbd !== normP
+                ? `Khớp Mã phách ${normP} → SBD ${mappedSbd}`
+                : rec.notes,
+          };
+        }
         if (field === "sbd") {
-          return { ...rec, rawSbd: value, sbd: normalizeSbdClient(value) };
+          const normCode = normalizeSbdClient(value);
+          const canonCode = canonicalSbdKey(value);
+          const mappedFromPhach =
+            phachToSbdMap[normCode] || phachToSbdMap[canonCode];
+          if (mappedFromPhach) {
+            return {
+              ...rec,
+              rawSbd: value,
+              maPhach: normCode,
+              sbd: mappedFromPhach,
+              notes: `Khớp Mã phách ${normCode} → SBD ${mappedFromPhach}`,
+            };
+          }
+          return {
+            ...rec,
+            rawSbd: value,
+            sbd: normCode,
+            maPhach: sbdToPhachMap[normCode] || sbdToPhachMap[canonCode] || rec.maPhach,
+          };
         }
         const parsedScore = parseVietnameseScoreClient(value);
         return {
@@ -887,18 +1115,22 @@ if __name__ == "__main__":
   const handleAddOcrRow = () => {
     const nextIdx = ocrRecords.length + 1;
     const defaultSbd =
-      knownSbds[nextIdx - 1] || `K6.${String(nextIdx).padStart(3, "0")}`;
+      knownSbds[nextIdx - 1] || `K9.${String(nextIdx).padStart(3, "0")}`;
+    const defaultPhach = sbdToPhachMap[defaultSbd] || "";
     setOcrRecords((prev) => [
       ...prev,
       {
         id: `manual-${Date.now()}`,
         sbd: defaultSbd,
-        rawSbd: defaultSbd,
+        rawSbd: defaultPhach || defaultSbd,
+        maPhach: defaultPhach || undefined,
         score: 8.0,
-        rawScoreText: "8,0",
-        scoreInWords: "Tám điểm",
+        rawScoreText: "8",
+        scoreInWords: "",
         confidence: "CAO",
-        notes: "Nhập thủ công",
+        notes: defaultPhach
+          ? `Mã phách ${defaultPhach} → SBD ${defaultSbd}`
+          : "Nhập thủ công",
         sourceImage: "Bổ sung trực tiếp",
       },
     ]);
@@ -914,7 +1146,7 @@ if __name__ == "__main__":
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
-      {/* Top Bar Contract: 3 Zones separated by gap-8 */}
+      {/* Top Bar */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 py-3.5 bg-white border-b border-slate-200">
         <a
           href="#top"
@@ -923,7 +1155,7 @@ if __name__ == "__main__":
           VietGrade OCR
         </a>
 
-        {/* 3-Step Sequential Navigation */}
+        {/* 2-Step Sequential Navigation */}
         <div className="flex items-center gap-1.5 p-1 bg-slate-100 rounded-lg">
           <button
             type="button"
@@ -943,7 +1175,7 @@ if __name__ == "__main__":
             >
               {excelData ? "✓" : "1"}
             </span>
-            <span>01. Nạp File Excel Nguồn</span>
+            <span>01. Nạp File Excel Nguồn (SBD &amp; Mã Phách)</span>
           </button>
 
           <button
@@ -964,16 +1196,33 @@ if __name__ == "__main__":
             >
               {ocrRecords.length > 0 ? "✓" : "2"}
             </span>
-            <span>02. Quét Ảnh &amp; Điền Điểm Excel</span>
+            <span>02. Quét PDF/Ảnh &amp; Điền Điểm Excel</span>
           </button>
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
           <input
-            ref={excelInputRef}
+            ref={excel1InputRef}
             type="file"
             accept=".xlsx, .xls"
-            onChange={handleExcelUpload}
+            multiple
+            onChange={(e) => {
+              if (e.target.files) {
+                handleSmartExcelFilesUpload(e.target.files, "SLOT_1_ROSTER");
+              }
+            }}
+            className="hidden"
+          />
+          <input
+            ref={excel2InputRef}
+            type="file"
+            accept=".xlsx, .xls"
+            multiple
+            onChange={(e) => {
+              if (e.target.files) {
+                handleSmartExcelFilesUpload(e.target.files, "SLOT_2_PHACH");
+              }
+            }}
             className="hidden"
           />
           <button
@@ -983,30 +1232,56 @@ if __name__ == "__main__":
             className="px-4 py-2 text-xs font-semibold text-white bg-blue-700 rounded-lg hover:bg-blue-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>{isExporting ? "Đang xử lý..." : "Xuất File Excel Đã Điền Điểm"}</span>
+            <span>
+              {isExporting ? "Đang xử lý..." : "Xuất File Excel Đã Điền Điểm"}
+            </span>
           </button>
         </div>
       </header>
 
       <main id="top" className="flex-1 max-w-[1400px] w-full mx-auto px-6 py-8 space-y-8">
         {/* Pipeline Status Strip */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 bg-white border border-slate-200 rounded-lg">
-          <div className="flex items-center gap-3.5">
-            <div
-              className={`p-2.5 rounded-lg ${
-                excelData
-                  ? "bg-emerald-50 text-emerald-700"
-                  : "bg-slate-100 text-slate-500"
-              }`}
-            >
-              <FileSpreadsheet className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="text-xs text-slate-500">
-                Bước 1 · File Excel Nguồn
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 p-4 bg-white border border-slate-200 rounded-lg">
+          <div className="flex flex-wrap items-center gap-6">
+            <div className="flex items-center gap-3">
+              <div
+                className={`p-2 rounded-lg ${
+                  excelData
+                    ? "bg-emerald-50 text-emerald-700"
+                    : "bg-slate-100 text-slate-500"
+                }`}
+              >
+                <FileSpreadsheet className="w-5 h-5" />
               </div>
-              <div className="text-sm font-bold text-slate-900 font-mono">
-                {excelData ? excelData.fileName : "Chưa tải lên file Excel nguồn"}
+              <div>
+                <div className="text-[11px] text-slate-500">
+                  File Excel 1 · Bảng Điểm SBD (Hình 1)
+                </div>
+                <div className="text-xs font-bold text-slate-900 font-mono">
+                  {excelData ? excelData.fileName : "Chưa tải lên"}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <div
+                className={`p-2 rounded-lg ${
+                  phachExcelData
+                    ? "bg-indigo-50 text-indigo-700"
+                    : "bg-slate-100 text-slate-500"
+                }`}
+              >
+                <Link2 className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-500">
+                  File Excel 2 · Bảng Mã Phách (Hình 2)
+                </div>
+                <div className="text-xs font-bold text-slate-900 font-mono">
+                  {phachExcelData
+                    ? `${phachExcelData.fileName} (${totalPhachMappedCount} mã phách)`
+                    : "Tùy chọn (nếu chấm theo Mã Phách)"}
+                </div>
               </div>
             </div>
           </div>
@@ -1014,10 +1289,18 @@ if __name__ == "__main__":
           <div className="flex flex-wrap items-center gap-6 text-xs font-mono tabular-nums">
             <div>
               <span className="text-slate-500">Học sinh: </span>
-              <span className="font-bold text-slate-900">{stats.totalExcelStudents}</span>
+              <span className="font-bold text-slate-900">
+                {stats.totalExcelStudents}
+              </span>
             </div>
             <div>
-              <span className="text-slate-500">Ảnh phiếu chấm: </span>
+              <span className="text-slate-500">Mã phách: </span>
+              <span className="font-bold text-indigo-700">
+                {totalPhachMappedCount}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-500">Phiếu chấm (PDF/Ảnh): </span>
               <span className="font-bold text-slate-900">{images.length}</span>
             </div>
             <div>
@@ -1030,16 +1313,29 @@ if __name__ == "__main__":
         </div>
 
         {/* =====================================================================
-            BƯỚC 1: TẢI LÊN FILE EXCEL NGUỒN TRƯỚC TIÊN (100% CLIENT-SIDE)
+            BƯỚC 1: TẢI LÊN 2 FILE EXCEL NGUỒN (HÌNH 1: BẢNG ĐIỂM SBD & HÌNH 2: BẢNG MÃ PHÁCH)
            ===================================================================== */}
         {currentStep === 1 && (
           <section className="space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h1 className="text-xl font-bold text-slate-900">
-                  01. Tải Lên File Excel Nguồn Cần Nhập Điểm
+                  01. Tải Lên 2 File Excel Nguồn (Bảng Điểm SBD &amp; Bảng Ghép Mã Phách)
                 </h1>
+                <p className="text-xs text-slate-500 mt-1">
+                  Tải lên File Excel 1 (Bảng điểm có cột SBD &amp; Điểm như Hình 1) và File Excel 2 (Bảng ghép cột SBD ↔ MÃ PHÁCH như Hình 2). Bạn có thể chọn từng file hoặc bôi đen chọn cả 2 file cùng lúc.
+                </p>
               </div>
+
+              <button
+                type="button"
+                onClick={handleLoadSamplePhachWorkspace}
+                disabled={isExcelLoading}
+                className="px-3.5 py-2 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors flex items-center gap-1.5 shrink-0 cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Thử Mẫu Hình 1 + Hình 2 + Hình 3 → Hình 4 (Anh 9)</span>
+              </button>
             </div>
 
             {excelError && (
@@ -1049,214 +1345,473 @@ if __name__ == "__main__":
               </div>
             )}
 
-            {/* Drag and Drop Zone */}
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsExcelDragging(true);
-              }}
-              onDragLeave={() => setIsExcelDragging(false)}
-              onDrop={handleExcelDrop}
-              onClick={() => excelInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-xl p-10 transition-colors text-center cursor-pointer ${
-                isExcelDragging
-                  ? "border-emerald-600 bg-emerald-50/80"
-                  : "border-slate-300 hover:border-emerald-600 bg-white"
-              }`}
-            >
-              <div className="max-w-md mx-auto flex flex-col items-center space-y-3">
-                <div className="w-12 h-12 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
-                  <FileSpreadsheet className="w-6 h-6" />
-                </div>
-                {excelData && (
-                  <div className="text-base font-bold text-slate-900">
-                    Đã nạp file nguồn:{" "}
-                    <span className="text-emerald-700 font-mono">{excelData.fileName}</span>
+            {/* 2 Side-by-Side Upload Zones for File Excel 1 (Hình 1) and File Excel 2 (Hình 2) */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {/* Upload Zone 1: Hình 1 - Bảng Điểm Thí Sinh */}
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsExcelDragging1(true);
+                }}
+                onDragLeave={() => setIsExcelDragging1(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsExcelDragging1(false);
+                  if (e.dataTransfer.files) {
+                    handleSmartExcelFilesUpload(
+                      e.dataTransfer.files,
+                      "SLOT_1_ROSTER"
+                    );
+                  }
+                }}
+                onClick={() => excel1InputRef.current?.click()}
+                className={`border-2 border-dashed rounded-xl p-7 transition-colors text-center cursor-pointer flex flex-col justify-between ${
+                  isExcelDragging1
+                    ? "border-emerald-600 bg-emerald-50/80"
+                    : excelData
+                    ? "border-emerald-500 bg-white"
+                    : "border-slate-300 hover:border-emerald-600 bg-white"
+                }`}
+              >
+                <div className="space-y-2.5">
+                  <div className="w-11 h-11 mx-auto rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
+                    <FileSpreadsheet className="w-5 h-5" />
                   </div>
-                )}
-                <div>
+                  <div className="text-sm font-bold text-slate-900">
+                    File Excel Nguồn 1: Bảng Điểm Thí Sinh (Hình 1)
+                  </div>
+                  <p className="text-xs text-slate-500 max-w-md mx-auto">
+                    File chứa danh sách học sinh, cột{" "}
+                    <span className="font-mono font-semibold text-slate-700">
+                      SBD
+                    </span>{" "}
+                    (VD: K9.001) và cột{" "}
+                    <span className="font-mono font-semibold text-slate-700">
+                      Điểm
+                    </span>{" "}
+                    để xuất ra thành Hình 4.
+                  </p>
+                  {excelData && (
+                    <div className="pt-1 text-xs font-bold text-emerald-700 font-mono">
+                      ✓ Đã nạp: {excelData.fileName} ({excelData.studentRows.length} học sinh)
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-4">
                   <span className="px-4 py-2 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-lg hover:bg-emerald-100 transition-colors inline-flex items-center gap-1.5">
                     <Upload className="w-3.5 h-3.5" />
                     <span>
-                      {excelData ? "Đổi sang file Excel khác" : "Duyệt chọn file Excel (.xlsx)"}
+                      {excelData
+                        ? "Đổi File Excel 1 (Bảng Điểm)"
+                        : "Chọn File Excel 1 (.xlsx)"}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* Upload Zone 2: Hình 2 - Bảng Ghép Mã Phách */}
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsExcelDragging2(true);
+                }}
+                onDragLeave={() => setIsExcelDragging2(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsExcelDragging2(false);
+                  if (e.dataTransfer.files) {
+                    handleSmartExcelFilesUpload(
+                      e.dataTransfer.files,
+                      "SLOT_2_PHACH"
+                    );
+                  }
+                }}
+                onClick={() => excel2InputRef.current?.click()}
+                className={`border-2 border-dashed rounded-xl p-7 transition-colors text-center cursor-pointer flex flex-col justify-between ${
+                  isExcelDragging2
+                    ? "border-indigo-600 bg-indigo-50/80"
+                    : phachExcelData
+                    ? "border-indigo-500 bg-white"
+                    : "border-slate-300 hover:border-indigo-600 bg-white"
+                }`}
+              >
+                <div className="space-y-2.5">
+                  <div className="w-11 h-11 mx-auto rounded-lg bg-indigo-50 border border-indigo-200 flex items-center justify-center text-indigo-700">
+                    <Link2 className="w-5 h-5" />
+                  </div>
+                  <div className="text-sm font-bold text-slate-900">
+                    File Excel Nguồn 2: Bảng Ghép Mã Phách (Hình 2)
+                  </div>
+                  <p className="text-xs text-slate-500 max-w-md mx-auto">
+                    File chứa cột{" "}
+                    <span className="font-mono font-semibold text-slate-700">
+                      SBD
+                    </span>{" "}
+                    (VD: K9.001) và cột{" "}
+                    <span className="font-mono font-semibold text-slate-700">
+                      MÃ PHÁCH
+                    </span>{" "}
+                    (VD: A40, A41, A42, A43).
+                  </p>
+                  {phachExcelData && (
+                    <div className="pt-1 text-xs font-bold text-indigo-700 font-mono">
+                      ✓ Đã nạp: {phachExcelData.fileName} (Khớp {totalPhachMappedCount} Mã phách)
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-4">
+                  <span className="px-4 py-2 text-xs font-semibold text-indigo-800 bg-indigo-50 border border-indigo-300 rounded-lg hover:bg-indigo-100 transition-colors inline-flex items-center gap-1.5">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>
+                      {phachExcelData
+                        ? "Đổi File Excel 2 (Bảng Mã Phách)"
+                        : "Chọn File Excel 2 (.xlsx)"}
                     </span>
                   </span>
                 </div>
               </div>
             </div>
 
-            {/* Structure Configuration & Roster Preview */}
-            {excelData && (
-              <div className="space-y-4 bg-white border border-slate-200 rounded-lg p-5">
+            {/* Configuration & Live Preview of Hình 1 + Hình 2 */}
+            {(excelData || phachExcelData) && (
+              <div className="space-y-5 bg-white border border-slate-200 rounded-lg p-5">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200">
                   <div>
                     <h2 className="text-sm font-bold text-slate-900">
-                      Cấu Trúc Bảng Điểm Đã Nhận Diện ({excelData.studentRows.length} học sinh)
+                      Cấu Trúc Cột Đã Nhận Diện &amp; Đối Chiếu SBD ↔ MÃ PHÁCH
                     </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Kiểm tra vị trí hàng tiêu đề, cột Số BD và cột Điểm trước khi sang Bước 2.
+                      Hệ thống tự động liên kết cột SBD của Hình 1 với cột SBD &amp; MÃ PHÁCH của Hình 2.
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => setCurrentStep(2)}
-                    className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <span>Tiếp tục: Bước 2 — Tải Ảnh &amp; Nhập Điểm</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </button>
+                  {excelData && (
+                    <button
+                      type="button"
+                      onClick={() => setCurrentStep(2)}
+                      className="px-4 py-2 text-xs font-bold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <span>Tiếp tục: Bước 2 — Tải PDF/Ảnh Hình 3 &amp; Khớp Điểm</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
-                  {/* Sheet selector */}
-                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <label
-                      htmlFor="step1-sheet"
-                      className="text-xs font-semibold text-slate-700 block mb-1"
-                    >
-                      Trang tính (Worksheet):
-                    </label>
-                    <select
-                      id="step1-sheet"
-                      value={selectedSheetIndex}
-                      onChange={(e) => handleSheetChange(Number(e.target.value))}
-                      className="w-full px-2.5 py-1.5 text-xs font-semibold border border-slate-300 rounded bg-white"
-                    >
-                      {(excelData.availableSheets || [{ index: 0, name: excelData.sheetName, rowCount: excelData.totalRows }]).map(
-                        (s) => (
-                          <option key={s.index} value={s.index}>
-                            {s.name} ({s.rowCount} hàng)
-                          </option>
-                        )
-                      )}
-                    </select>
-                  </div>
-
-                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <label
-                      htmlFor="step1-header-row"
-                      className="text-xs font-semibold text-slate-700 block mb-1"
-                    >
-                      Hàng tiêu đề (Header Row):
-                    </label>
-                    <input
-                      id="step1-header-row"
-                      type="number"
-                      min={1}
-                      max={20}
-                      value={headerRow}
-                      onChange={(e) =>
-                        handleHeaderRowChange(Math.max(1, Number(e.target.value) || 5))
-                      }
-                      className="w-full px-2.5 py-1.5 font-mono text-xs font-semibold border border-slate-300 rounded bg-white tabular-nums"
-                    />
-                  </div>
-
-                  <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
-                    <label
-                      htmlFor="step1-sbd-col"
-                      className="text-xs font-semibold text-slate-700 block mb-1"
-                    >
-                      Cột Số Báo Danh (SBD):
-                    </label>
-                    <select
-                      id="step1-sbd-col"
-                      value={sbdCol}
-                      onChange={(e) => setSbdCol(e.target.value)}
-                      className="w-full px-2.5 py-1.5 font-mono text-xs font-semibold border border-slate-300 rounded bg-white"
-                    >
-                      {excelData.headers.map((h) => (
-                        <option key={h.colLetter} value={h.colLetter}>
-                          Cột {h.colLetter} ({h.label})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="p-3 bg-blue-50/60 rounded-lg border border-blue-200">
-                    <label
-                      htmlFor="step1-score-col"
-                      className="text-xs font-semibold text-blue-900 block mb-1"
-                    >
-                      Cột Điểm (Chỉ ghi đè cột này):
-                    </label>
-                    <select
-                      id="step1-score-col"
-                      value={scoreCol}
-                      onChange={(e) => setScoreCol(e.target.value)}
-                      className="w-full px-2.5 py-1.5 font-mono text-xs font-bold text-blue-700 border border-blue-300 rounded bg-white"
-                    >
-                      {excelData.headers.map((h) => (
-                        <option key={h.colLetter} value={h.colLetter}>
-                          Cột {h.colLetter} ({h.label})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                {/* Roster Preview */}
-                <div className="border border-slate-200 rounded-lg overflow-hidden">
-                  <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700 flex justify-between items-center">
-                    <span>
-                      Xem trước danh sách học sinh (Từ hàng {headerRow + 1} trở đi):
-                    </span>
-                    <span className="font-mono tabular-nums text-slate-500">
-                      Tổng cộng: {excelData.studentRows.length} học sinh
-                    </span>
-                  </div>
-                  <div className="overflow-x-auto max-h-[260px]">
-                    <table className="w-full text-left text-xs border-collapse">
-                      <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 font-semibold text-slate-600">
-                        <tr>
-                          <th className="py-2 px-3 w-14 text-center">Hàng</th>
-                          {excelData.headers.map((h) => (
-                            <th key={h.colLetter} className="py-2 px-3 whitespace-nowrap">
-                              {h.label} ({h.colLetter})
-                            </th>
+                {/* File Excel 1 Column Mapping */}
+                {excelData && (
+                  <div className="space-y-2">
+                    <div className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
+                      <span>1. Cấu hình File Excel 1 — Bảng Điểm Thí Sinh ({excelData.fileName}):</span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                      <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                        <label
+                          htmlFor="step1-sheet"
+                          className="text-[11px] font-semibold text-slate-700 block mb-1"
+                        >
+                          Trang tính (Worksheet):
+                        </label>
+                        <select
+                          id="step1-sheet"
+                          value={selectedSheetIndex}
+                          onChange={(e) =>
+                            handleSheetChange1(Number(e.target.value))
+                          }
+                          className="w-full px-2 py-1 text-xs font-semibold border border-slate-300 rounded bg-white"
+                        >
+                          {(
+                            excelData.availableSheets || [
+                              {
+                                index: 0,
+                                name: excelData.sheetName,
+                                rowCount: excelData.totalRows,
+                              },
+                            ]
+                          ).map((s) => (
+                            <option key={s.index} value={s.index}>
+                              {s.name} ({s.rowCount} hàng)
+                            </option>
                           ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-200">
-                        {excelData.studentRows.slice(0, 10).map((row) => (
-                          <tr key={row.rowNumber} className="hover:bg-slate-50">
-                            <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
-                              {row.rowNumber}
-                            </td>
+                        </select>
+                      </div>
+
+                      <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                        <label
+                          htmlFor="step1-header-row"
+                          className="text-[11px] font-semibold text-slate-700 block mb-1"
+                        >
+                          Hàng tiêu đề (Header Row):
+                        </label>
+                        <input
+                          id="step1-header-row"
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={headerRow}
+                          onChange={(e) =>
+                            handleHeaderRowChange1(
+                              Math.max(1, Number(e.target.value) || 6)
+                            )
+                          }
+                          className="w-full px-2 py-1 font-mono text-xs font-semibold border border-slate-300 rounded bg-white tabular-nums"
+                        />
+                      </div>
+
+                      <div className="p-2.5 bg-amber-50/60 rounded-lg border border-amber-200">
+                        <label
+                          htmlFor="step1-sbd-col"
+                          className="text-[11px] font-semibold text-amber-900 block mb-1"
+                        >
+                          Cột SBD (Hình 1):
+                        </label>
+                        <select
+                          id="step1-sbd-col"
+                          value={sbdCol}
+                          onChange={(e) => setSbdCol(e.target.value)}
+                          className="w-full px-2 py-1 font-mono text-xs font-bold text-amber-900 border border-amber-300 rounded bg-white"
+                        >
+                          {excelData.headers.map((h) => (
+                            <option key={h.colLetter} value={h.colLetter}>
+                              Cột {h.colLetter} ({h.label})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="p-2.5 bg-blue-50/60 rounded-lg border border-blue-200">
+                        <label
+                          htmlFor="step1-score-col"
+                          className="text-[11px] font-semibold text-blue-900 block mb-1"
+                        >
+                          Cột Điểm Cần Điền (Hình 4):
+                        </label>
+                        <select
+                          id="step1-score-col"
+                          value={scoreCol}
+                          onChange={(e) => setScoreCol(e.target.value)}
+                          className="w-full px-2 py-1 font-mono text-xs font-bold text-blue-700 border border-blue-300 rounded bg-white"
+                        >
+                          {excelData.headers.map((h) => (
+                            <option key={h.colLetter} value={h.colLetter}>
+                              Cột {h.colLetter} ({h.label})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* File Excel 2 Column Mapping (Hình 2: SBD <-> MÃ PHÁCH) */}
+                {phachExcelData && (
+                  <div className="space-y-2 pt-2 border-t border-slate-200">
+                    <div className="text-xs font-bold text-indigo-900 flex items-center justify-between">
+                      <span>
+                        2. Cấu hình File Excel 2 — Bảng Ghép Mã Phách ({phachExcelData.fileName}):
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setPhachExcelData(null)}
+                        className="text-[11px] font-normal text-slate-500 hover:text-red-600 cursor-pointer"
+                      >
+                        Gỡ File Excel 2
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                      <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                        <label
+                          htmlFor="step1-phach-sheet"
+                          className="text-[11px] font-semibold text-slate-700 block mb-1"
+                        >
+                          Trang tính (Worksheet):
+                        </label>
+                        <select
+                          id="step1-phach-sheet"
+                          value={phachSheetIndex}
+                          onChange={(e) =>
+                            handleSheetChange2(Number(e.target.value))
+                          }
+                          className="w-full px-2 py-1 text-xs font-semibold border border-slate-300 rounded bg-white"
+                        >
+                          {(
+                            phachExcelData.availableSheets || [
+                              {
+                                index: 0,
+                                name: phachExcelData.sheetName,
+                                rowCount: phachExcelData.totalRows,
+                              },
+                            ]
+                          ).map((s) => (
+                            <option key={s.index} value={s.index}>
+                              {s.name} ({s.rowCount} hàng)
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                        <label
+                          htmlFor="step1-phach-header-row"
+                          className="text-[11px] font-semibold text-slate-700 block mb-1"
+                        >
+                          Hàng tiêu đề (Header Row):
+                        </label>
+                        <input
+                          id="step1-phach-header-row"
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={phachHeaderRow}
+                          onChange={(e) =>
+                            handleHeaderRowChange2(
+                              Math.max(1, Number(e.target.value) || 4)
+                            )
+                          }
+                          className="w-full px-2 py-1 font-mono text-xs font-semibold border border-slate-300 rounded bg-white tabular-nums"
+                        />
+                      </div>
+
+                      <div className="p-2.5 bg-amber-50/60 rounded-lg border border-amber-200">
+                        <label
+                          htmlFor="step1-phach-sbd-col"
+                          className="text-[11px] font-semibold text-amber-900 block mb-1"
+                        >
+                          Cột SBD (Hình 2):
+                        </label>
+                        <select
+                          id="step1-phach-sbd-col"
+                          value={phachSbdCol}
+                          onChange={(e) => setPhachSbdCol(e.target.value)}
+                          className="w-full px-2 py-1 font-mono text-xs font-bold text-amber-900 border border-amber-300 rounded bg-white"
+                        >
+                          {phachExcelData.headers.map((h) => (
+                            <option key={h.colLetter} value={h.colLetter}>
+                              Cột {h.colLetter} ({h.label})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="p-2.5 bg-indigo-50/70 rounded-lg border border-indigo-200">
+                        <label
+                          htmlFor="step1-phach-code-col"
+                          className="text-[11px] font-semibold text-indigo-900 block mb-1"
+                        >
+                          Cột MÃ PHÁCH (Hình 2):
+                        </label>
+                        <select
+                          id="step1-phach-code-col"
+                          value={phachCodeCol}
+                          onChange={(e) => setPhachCodeCol(e.target.value)}
+                          className="w-full px-2 py-1 font-mono text-xs font-bold text-indigo-700 border border-indigo-300 rounded bg-white"
+                        >
+                          {phachExcelData.headers.map((h) => (
+                            <option key={h.colLetter} value={h.colLetter}>
+                              Cột {h.colLetter} ({h.label})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Combined Roster + Mã Phách Preview */}
+                {excelData && (
+                  <div className="border border-slate-200 rounded-lg overflow-hidden">
+                    <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700 flex justify-between items-center">
+                      <span>
+                        Xem trước danh sách học sinh &amp; Mã Phách đã khớp (Từ hàng{" "}
+                        {headerRow + 1} trở đi):
+                      </span>
+                      <span className="font-mono tabular-nums text-slate-500">
+                        Tổng cộng: {excelData.studentRows.length} học sinh
+                      </span>
+                    </div>
+                    <div className="overflow-x-auto max-h-[280px]">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 font-semibold text-slate-600">
+                          <tr>
+                            <th className="py-2 px-3 w-14 text-center">Hàng</th>
                             {excelData.headers.map((h) => (
-                              <td
-                                key={h.colLetter}
-                                className={`py-2 px-3 ${
-                                  h.colLetter === sbdCol
-                                    ? "font-mono font-bold text-slate-900 bg-amber-50/50 tabular-nums"
-                                    : "text-slate-700"
-                                }`}
-                              >
-                                {String(row.cells[h.colLetter] ?? "")}
-                              </td>
+                              <React.Fragment key={h.colLetter}>
+                                <th className="py-2 px-3 whitespace-nowrap">
+                                  {h.label} ({h.colLetter})
+                                </th>
+                                {h.colLetter === sbdCol && phachExcelData && (
+                                  <th className="py-2 px-3 whitespace-nowrap bg-indigo-50 text-indigo-900 border-x border-indigo-200">
+                                    MÃ PHÁCH (Khớp Hình 2)
+                                  </th>
+                                )}
+                              </React.Fragment>
                             ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {matchedStudentRows.slice(0, 15).map((row) => (
+                            <tr key={row.rowNumber} className="hover:bg-slate-50">
+                              <td className="py-2 px-3 text-center font-mono tabular-nums text-slate-400">
+                                {row.rowNumber}
+                              </td>
+                              {excelData.headers.map((h) => (
+                                <React.Fragment key={h.colLetter}>
+                                  <td
+                                    className={`py-2 px-3 ${
+                                      h.colLetter === sbdCol
+                                        ? "font-mono font-bold text-slate-900 bg-amber-50/50 tabular-nums"
+                                        : "text-slate-700"
+                                    }`}
+                                  >
+                                    {String(row.cells[h.colLetter] ?? "")}
+                                  </td>
+                                  {h.colLetter === sbdCol && phachExcelData && (
+                                    <td className="py-2 px-3 font-mono font-bold text-indigo-700 bg-indigo-50/40 border-x border-indigo-100 tabular-nums">
+                                      {row.linkedPhach ? (
+                                        row.linkedPhach
+                                      ) : (
+                                        <span className="text-slate-400 font-normal italic">
+                                          Trống
+                                        </span>
+                                      )}
+                                    </td>
+                                  )}
+                                </React.Fragment>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             )}
           </section>
         )}
 
         {/* =====================================================================
-            BƯỚC 2: TẢI ẢNH PHIẾU CHẤM & TRÍCH XUẤT ĐIỂM (KHÔNG CẦN API / LOCAL WASM)
+            BƯỚC 2: TẢI FILE PDF / ẢNH PHIẾU CHẤM (HÌNH 3) & XUẤT EXCEL (HÌNH 4)
            ===================================================================== */}
         {currentStep === 2 && (
           <section className="space-y-5">
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div>
                 <h1 className="text-xl font-bold text-slate-900">
-                  02. Tải Ảnh Phiếu Chấm Bài Thi &amp; Trích Xuất Điểm
+                  02. Tải File PDF / Ảnh Phiếu Chấm (Hình 3) &amp; Xuất File Excel (Hình 4)
                 </h1>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Hệ thống tự động đọc cột{" "}
+                  <span className="font-mono font-semibold text-slate-700">
+                    MÃ PHÁCH
+                  </span>{" "}
+                  (hoặc SBD) và{" "}
+                  <span className="font-mono font-semibold text-slate-700">
+                    ĐIỂM BẰNG SỐ
+                  </span>{" "}
+                  trên phiếu chấm (Hình 3), đối chiếu qua Bảng Mã Phách (Hình 2) để điền điểm vào đúng học sinh trên Bảng Điểm (Hình 4).
+                </p>
               </div>
 
               <input
@@ -1274,7 +1829,7 @@ if __name__ == "__main__":
               <div className="p-4 bg-white border border-slate-300 rounded-lg space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-bold text-slate-900">
-                    Dán Nhanh Danh Sách Điểm
+                    Dán Nhanh Danh Sách Điểm (Theo Mã Phách hoặc SBD)
                   </div>
                   <button
                     type="button"
@@ -1284,12 +1839,12 @@ if __name__ == "__main__":
                     Đóng
                   </button>
                 </div>
-                
+
                 <textarea
                   rows={4}
                   value={bulkPasteText}
                   onChange={(e) => setBulkPasteText(e.target.value)}
-                  placeholder={"K6.001  8,5\nK6.002  6,7\nK6.003  7,4"}
+                  placeholder={"A40  8\nA41  8,50\nA42  8\nA43  8"}
                   className="w-full p-2.5 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:border-blue-600"
                 />
                 <div className="flex justify-end">
@@ -1313,7 +1868,7 @@ if __name__ == "__main__":
             )}
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-              {/* Left Column (5 cols): Grading Sheet Photo Viewer */}
+              {/* Left Column (5 cols): Grading Sheet Photo / PDF Page Viewer (Hình 3) */}
               <div className="lg:col-span-5 bg-white border border-slate-200 rounded-lg flex flex-col overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-2 bg-slate-50">
                   <div className="flex items-center gap-2 text-xs font-medium text-slate-700 truncate">
@@ -1408,31 +1963,43 @@ if __name__ == "__main__":
                   ) : (
                     <div className="my-auto text-center p-8 space-y-4">
                       <ScanText className="w-8 h-8 text-slate-400 mx-auto" />
+                      <div className="text-xs text-slate-500 max-w-xs mx-auto">
+                        Tải lên file PDF (gộp nhiều trang phiếu chấm) hoặc ảnh chụp Phiếu Chấm Bài Thi (Hình 3).
+                      </div>
                       <button
                         type="button"
                         onClick={() => imageInputRef.current?.click()}
                         className="px-4 py-2 text-xs font-bold text-white bg-blue-700 rounded-lg hover:bg-blue-800 transition-colors cursor-pointer"
                       >
-                        Chọn ảnh hoặc file PDF phiếu chấm từ máy
+                        Chọn file PDF hoặc Ảnh phiếu chấm
                       </button>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* Right Column (7 cols): Either Rapid Keyboard Grid by Excel SBD OR Extracted OCR Table */}
+              {/* Right Column (7 cols): Extracted OCR Table (MÃ PHÁCH <-> SBD <-> ĐIỂM) */}
               <div className="lg:col-span-7 bg-white border border-slate-200 rounded-lg flex flex-col overflow-hidden">
                 {engineMode === "RAPID_KEYBOARD" && excelData ? (
                   <>
                     <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-4 bg-blue-50/60">
                       <div className="text-xs font-semibold text-blue-950">
-                        Nhập Nhanh Theo Danh Sách SBD File Nguồn (Gõ{" "}
+                        Nhập Nhanh Theo Danh Sách (Gõ{" "}
                         <code className="font-mono">8,5</code> + nhấn{" "}
-                        <code className="font-mono">Enter</code> để tự động xuống dòng)
+                        <code className="font-mono">Enter</code>)
                       </div>
-                      <span className="text-xs font-mono tabular-nums text-blue-800 font-bold">
-                        Đã nhập: {stats.matchedCount}/{excelData.studentRows.length}
-                      </span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs font-mono tabular-nums text-blue-800 font-bold">
+                          Đã nhập: {stats.matchedCount}/{excelData.studentRows.length}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setEngineMode("HYBRID_CLOUD")}
+                          className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 cursor-pointer"
+                        >
+                          Về Bảng OCR
+                        </button>
+                      </div>
                     </div>
 
                     <div className="flex-1 overflow-auto max-h-[540px]">
@@ -1440,11 +2007,16 @@ if __name__ == "__main__":
                         <thead className="sticky top-0 bg-slate-100 border-b border-slate-200 text-[11px] font-semibold text-slate-600">
                           <tr>
                             <th className="py-2.5 px-3 w-12 text-center">Hàng</th>
-                            <th className="py-2.5 px-3">Số Báo Danh (Cột {sbdCol})</th>
-                            <th className="py-2.5 px-3">Họ và tên / Thông tin</th>
-                            <th className="py-2.5 px-3 w-36">Gõ Điểm (VD: 8,5)</th>
-                            <th className="py-2.5 px-3 text-right w-28">
-                              Điểm Chuẩn (Cột {scoreCol})
+                            <th className="py-2.5 px-3">SBD (Cột {sbdCol})</th>
+                            {phachExcelData && (
+                              <th className="py-2.5 px-3 text-indigo-800">
+                                Mã Phách (Hình 2)
+                              </th>
+                            )}
+                            <th className="py-2.5 px-3">Họ và tên</th>
+                            <th className="py-2.5 px-3 w-32">Gõ Điểm</th>
+                            <th className="py-2.5 px-3 text-right w-24">
+                              Điểm (Cột {scoreCol})
                             </th>
                           </tr>
                         </thead>
@@ -1453,12 +2025,15 @@ if __name__ == "__main__":
                             const norm = row.normalizedSbd;
                             const inputVal =
                               rapidInputs[norm] ??
-                              (row.matchedRawText !== null ? row.matchedRawText : "");
+                              (row.matchedRawText !== null
+                                ? row.matchedRawText
+                                : "");
                             const studentName =
-                              row.cells["C"] ||
                               row.cells["B"] ||
+                              row.cells["C"] ||
                               Object.values(row.cells).find(
-                                (v) => typeof v === "string" && v !== row.displaySbd
+                                (v) =>
+                                  typeof v === "string" && v !== row.displaySbd
                               ) ||
                               "";
 
@@ -1477,7 +2052,16 @@ if __name__ == "__main__":
                                 <td className="py-2 px-3 font-mono font-bold text-slate-900 tabular-nums">
                                   {row.displaySbd}
                                 </td>
-                                <td className="py-2 px-3 text-slate-700 truncate max-w-[200px]">
+                                {phachExcelData && (
+                                  <td className="py-2 px-3 font-mono font-bold text-indigo-700 tabular-nums">
+                                    {row.linkedPhach || (
+                                      <span className="text-slate-300 font-normal">
+                                        Trống
+                                      </span>
+                                    )}
+                                  </td>
+                                )}
+                                <td className="py-2 px-3 text-slate-700 truncate max-w-[180px]">
                                   {String(studentName)}
                                 </td>
                                 <td className="py-1.5 px-3">
@@ -1490,7 +2074,11 @@ if __name__ == "__main__":
                                     value={inputVal}
                                     onFocus={() => setActiveRapidRowIdx(rIdx)}
                                     onChange={(e) =>
-                                      handleRapidScoreChange(row.displaySbd, e.target.value)
+                                      handleRapidScoreChange(
+                                        row.displaySbd,
+                                        row.linkedPhach,
+                                        e.target.value
+                                      )
                                     }
                                     onKeyDown={(e) =>
                                       handleRapidKeyDown(
@@ -1499,12 +2087,14 @@ if __name__ == "__main__":
                                         matchedStudentRows.length
                                       )
                                     }
-                                    className="w-28 px-2.5 py-1 font-mono font-semibold text-slate-900 bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 tabular-nums"
+                                    className="w-24 px-2.5 py-1 font-mono font-semibold text-slate-900 bg-white border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:ring-2 focus:ring-blue-100 tabular-nums"
                                   />
                                 </td>
                                 <td className="py-2 px-3 text-right font-mono font-bold tabular-nums text-sm">
                                   {row.matchedScore !== null ? (
-                                    <span className="text-emerald-700">{row.matchedScore}</span>
+                                    <span className="text-emerald-700">
+                                      {row.matchedScore}
+                                    </span>
                                   ) : (
                                     <span className="text-slate-300 font-normal text-xs">
                                       Trống
@@ -1522,10 +2112,12 @@ if __name__ == "__main__":
                   <>
                     <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-4 bg-slate-50">
                       <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
-                        <span>Bảng Kết Quả OCR (SBD — Điểm Số)</span>
+                        <span>
+                          Bảng Kết Quả OCR &amp; Khớp Phách (Mã Phách ↔ SBD ↔ Điểm)
+                        </span>
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums text-slate-500">
-                          {ocrRecords.length} bản ghi
+                          {resolvedOcrRecords.length} bản ghi
                         </span>
                       </div>
 
@@ -1535,7 +2127,7 @@ if __name__ == "__main__":
                           onClick={() => setEngineMode("RAPID_KEYBOARD")}
                           className="px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded transition-colors cursor-pointer"
                         >
-                          Chuyển sang Gõ Nhanh theo SBD
+                          Chuyển sang Gõ Nhanh
                         </button>
                         <button
                           type="button"
@@ -1554,9 +2146,14 @@ if __name__ == "__main__":
                           <div className="flex items-center justify-between text-xs font-semibold text-blue-900">
                             <div className="flex items-center gap-2">
                               <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-700 shrink-0" />
-                              <span>{ocrProgressText || "Đang xử lý hàng loạt ảnh phiếu chấm..."}</span>
+                              <span>
+                                {ocrProgressText ||
+                                  "Đang xử lý hàng loạt trang phiếu chấm..."}
+                              </span>
                             </div>
-                            <span className="font-mono tabular-nums">{ocrProgressPct}%</span>
+                            <span className="font-mono tabular-nums">
+                              {ocrProgressPct}%
+                            </span>
                           </div>
                           <div className="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden">
                             <div
@@ -1567,7 +2164,7 @@ if __name__ == "__main__":
                         </div>
                       )}
 
-                      {isOcrRunning && ocrRecords.length === 0 ? (
+                      {isOcrRunning && resolvedOcrRecords.length === 0 ? (
                         <div className="p-6 space-y-2.5">
                           {[1, 2, 3, 4, 5].map((n) => (
                             <div
@@ -1576,18 +2173,25 @@ if __name__ == "__main__":
                             />
                           ))}
                         </div>
-                      ) : ocrRecords.length === 0 ? (
+                      ) : resolvedOcrRecords.length === 0 ? (
                         <div className="p-12 text-center space-y-4">
                           <div className="text-sm font-semibold text-slate-700">
-                            Chưa có dữ liệu điểm nào
+                            Chưa có dữ liệu điểm nào từ Phiếu Chấm (Hình 3)
                           </div>
                           <div className="flex items-center justify-center gap-3">
+                            <button
+                              type="button"
+                              onClick={() => imageInputRef.current?.click()}
+                              className="px-3.5 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
+                            >
+                              Tải File PDF / Ảnh Phiếu Chấm
+                            </button>
                             <button
                               type="button"
                               onClick={() => setEngineMode("RAPID_KEYBOARD")}
                               className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
                             >
-                              Gõ Nhanh Theo SBD (1 giây/học sinh)
+                              Gõ Nhanh Theo SBD
                             </button>
                           </div>
                         </div>
@@ -1595,19 +2199,35 @@ if __name__ == "__main__":
                         <table className="w-full text-left border-collapse">
                           <thead>
                             <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-semibold text-slate-600">
-                              <th className="py-2.5 px-3 w-12 text-center">#</th>
-                              <th className="py-2.5 px-3">SBD Chuẩn Hóa</th>
-                              <th className="py-2.5 px-3">Điểm Gốc (Dấu phẩy)</th>
-                              <th className="py-2.5 px-3 text-right">Điểm Chuẩn (Float)</th>
-                              <th className="py-2.5 px-3">Ghi Chú Xác Thực</th>
-                              <th className="py-2.5 px-3 w-12 text-center">Xóa</th>
+                              <th className="py-2.5 px-3 w-10 text-center">#</th>
+                              <th className="py-2.5 px-3">
+                                Mã Phách (Hình 3 &amp; 2)
+                              </th>
+                              <th className="py-2.5 px-3">
+                                SBD Khớp (Hình 1 &amp; 2)
+                              </th>
+                              <th className="py-2.5 px-3">
+                                Điểm Gốc (Hình 3)
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Điểm Chuẩn (Hình 4)
+                              </th>
+                              <th className="py-2.5 px-3 w-10 text-center">
+                                Xóa
+                              </th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-200 text-xs">
-                            {ocrRecords.map((rec, index) => {
-                              const isMatchedInExcel = knownSbds.includes(
-                                normalizeSbdClient(rec.sbd)
-                              );
+                            {resolvedOcrRecords.map((rec, index) => {
+                              const isMatchedInExcel =
+                                knownSbds.includes(
+                                  normalizeSbdClient(rec.resolvedSbd)
+                                ) ||
+                                knownSbds.some(
+                                  (k) =>
+                                    canonicalSbdKey(k) ===
+                                    canonicalSbdKey(rec.resolvedSbd)
+                                );
 
                               return (
                                 <tr
@@ -1618,14 +2238,33 @@ if __name__ == "__main__":
                                     {index + 1}
                                   </td>
                                   <td className="py-2 px-3">
+                                    <input
+                                      type="text"
+                                      placeholder="—"
+                                      value={rec.resolvedPhach || ""}
+                                      onChange={(e) =>
+                                        handleUpdateOcrRow(
+                                          rec.id,
+                                          "maPhach",
+                                          e.target.value
+                                        )
+                                      }
+                                      className="w-20 px-2 py-1 font-mono font-bold text-indigo-700 bg-indigo-50/50 border border-indigo-200 rounded focus:outline-none focus:border-indigo-600 focus:bg-white tabular-nums"
+                                    />
+                                  </td>
+                                  <td className="py-2 px-3">
                                     <div className="flex items-center gap-2">
                                       <input
                                         type="text"
-                                        value={rec.sbd}
+                                        value={rec.resolvedSbd}
                                         onChange={(e) =>
-                                          handleUpdateOcrRow(rec.id, "sbd", e.target.value)
+                                          handleUpdateOcrRow(
+                                            rec.id,
+                                            "sbd",
+                                            e.target.value
+                                          )
                                         }
-                                        className="w-28 px-2 py-1 font-mono font-semibold text-slate-900 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
+                                        className="w-24 px-2 py-1 font-mono font-semibold text-slate-900 bg-slate-50 border border-slate-300 rounded focus:outline-none focus:border-blue-600 focus:bg-white tabular-nums"
                                       />
                                       {isMatchedInExcel ? (
                                         <span className="text-[11px] text-emerald-700 font-medium whitespace-nowrap">
@@ -1655,9 +2294,6 @@ if __name__ == "__main__":
                                   <td className="py-2 px-3 text-right font-mono font-bold text-blue-700 tabular-nums text-sm">
                                     {rec.score}
                                   </td>
-                                  <td className="py-2 px-3 text-slate-600 truncate max-w-[220px]">
-                                    {rec.notes}
-                                  </td>
                                   <td className="py-2 px-3 text-center">
                                     <button
                                       type="button"
@@ -1680,15 +2316,18 @@ if __name__ == "__main__":
               </div>
             </div>
 
-            {/* Live Matched Excel Preview (Hình 3: Kết Quả So Khớp SBD Hình 1 × Hình 2) */}
-            {excelData && ocrRecords.length > 0 && (
+            {/* Live Matched Excel Preview (Hình 4: Kết Quả So Khớp SBD Hình 1 × Mã Phách Hình 2 × Điểm Hình 3) */}
+            {excelData && resolvedOcrRecords.length > 0 && (
               <div className="bg-white border-2 border-emerald-600/80 rounded-lg overflow-hidden shadow-xs">
                 <div className="px-4 py-3 bg-emerald-50/80 border-b border-emerald-200 flex items-center justify-between">
                   <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
                     <span>
-                      KẾT QUẢ SO KHỚP CỘT SBD: Đã khớp{" "}
+                      XEM TRƯỚC FILE EXCEL XUẤT RA (HÌNH 4): Đã khớp{" "}
                       {stats.matchedCount}/{stats.totalExcelStudents} học sinh
+                      {phachExcelData
+                        ? ` (Qua cầu nối SBD ↔ MÃ PHÁCH)`
+                        : ""}
                     </span>
                   </div>
                 </div>
@@ -1717,7 +2356,9 @@ if __name__ == "__main__":
                           <div className="text-[13px] tracking-tight">
                             SỞ GIÁO DỤC VÀ ĐÀO TẠO TỈNH NINH BÌNH
                           </div>
-                          <div className="text-[13px] font-bold pl-8">TRƯỜNG THCS MỸ XÁ</div>
+                          <div className="text-[13px] font-bold pl-8">
+                            TRƯỜNG THCS MỸ XÁ
+                          </div>
                         </div>
                       </div>
                       <div className="text-center font-bold text-sm mt-1">
@@ -1727,7 +2368,7 @@ if __name__ == "__main__":
                   )}
                 </div>
 
-                {/* Matched Excel Table (Exact Hình 3 Layout) */}
+                {/* Matched Excel Table (Exact Hình 4 Layout) */}
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse text-xs">
                     <thead>
@@ -1802,7 +2443,9 @@ if __name__ == "__main__":
                                     : "text-center text-slate-800 tabular-nums"
                                 }`}
                               >
-                                {val !== null && val !== undefined ? String(val) : ""}
+                                {val !== null && val !== undefined
+                                  ? String(val)
+                                  : ""}
                               </td>
                             );
                           })}
@@ -1815,15 +2458,16 @@ if __name__ == "__main__":
             )}
 
             {/* Excel Export Card Directly In Step 2 */}
-            {excelData && ocrRecords.length > 0 && (
+            {excelData && resolvedOcrRecords.length > 0 && (
               <div className="max-w-2xl mx-auto w-full bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-base font-bold text-slate-900">
-                      Xuất File Excel Đã Nhập Điểm Hoàn Chỉnh
+                      Xuất File Excel Hoàn Chỉnh (Hình 4)
                     </h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Đã điền điểm số thực Float vào cột {scoreCol}, bảo toàn 100% định dạng file nguồn.
+                      Đã khớp SBD ↔ Mã Phách và điền điểm số thực Float vào cột{" "}
+                      {scoreCol}, bảo toàn 100% định dạng File Excel 1.
                     </p>
                   </div>
                   <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-700">
@@ -1833,18 +2477,28 @@ if __name__ == "__main__":
 
                 <div className="grid grid-cols-3 gap-3 text-xs border-t border-b border-slate-200 py-3.5 bg-slate-50/60 rounded-lg px-3">
                   <div className="text-center">
-                    <div className="text-slate-500 text-[11px]">Tiêu đề Sở/Trường</div>
+                    <div className="text-slate-500 text-[11px]">
+                      Tiêu đề Sở/Trường
+                    </div>
                     <div className="font-mono text-emerald-700 font-bold mt-0.5">
                       Bảo toàn ({excelData?.mergedCellsCount || 0} Merges)
                     </div>
                   </div>
                   <div className="text-center border-x border-slate-200">
-                    <div className="text-slate-500 text-[11px]">Font chữ &amp; Viền kẻ</div>
-                    <div className="font-mono text-slate-900 font-bold mt-0.5">Giữ nguyên 100%</div>
+                    <div className="text-slate-500 text-[11px]">
+                      Khớp SBD ↔ Mã Phách
+                    </div>
+                    <div className="font-mono text-indigo-700 font-bold mt-0.5">
+                      {stats.matchedCount}/{stats.totalExcelStudents} học sinh
+                    </div>
                   </div>
                   <div className="text-center">
-                    <div className="text-slate-500 text-[11px]">Kiểu dữ liệu điểm</div>
-                    <div className="font-mono text-blue-700 font-bold mt-0.5">Số thực (Float)</div>
+                    <div className="text-slate-500 text-[11px]">
+                      Kiểu dữ liệu điểm
+                    </div>
+                    <div className="font-mono text-blue-700 font-bold mt-0.5">
+                      Số thực (Float)
+                    </div>
                   </div>
                 </div>
 
@@ -1857,7 +2511,9 @@ if __name__ == "__main__":
                 <button
                   type="button"
                   onClick={handleExecuteAndExport}
-                  disabled={isExporting || !excelData || ocrRecords.length === 0}
+                  disabled={
+                    isExporting || !excelData || resolvedOcrRecords.length === 0
+                  }
                   className="w-full py-3 px-4 text-sm font-bold text-white bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 rounded-lg transition-colors flex items-center justify-center gap-2 shadow-xs cursor-pointer"
                 >
                   <Download className="w-4 h-4" />

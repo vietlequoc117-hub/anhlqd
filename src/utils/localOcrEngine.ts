@@ -100,8 +100,8 @@ export function parseScoreFromVietnameseWords(text: string): {
 }
 
 /**
- * Extracts and cleans the SBD column (x: 9.5%..23.5%, y: 17.5%..75.5%) and Score column (x: 23.5%..38.5%),
- * removing horizontal table grid lines and upscaling 3x so Tesseract can read all 24-25 rows cleanly.
+ * Extracts and cleans the SBD/Mã Phách column and Score column,
+ * removing horizontal table grid lines and upscaling 2x so Tesseract can read rows cleanly.
  */
 async function prepareTableColumnCrops(dataUrl: string): Promise<{
   sbdCropUrl: string;
@@ -135,11 +135,11 @@ async function prepareTableColumnCrops(dataUrl: string): Promise<{
           0.114 * rgba[i * 4 + 2];
       }
 
-      // 1. SBD Column Crop (x: 10%..23%, y: 17.5%..75%) with horizontal grid-line removal + 3x upscale
+      // 1. SBD / Mã Phách Column Crop (x: 9.8%..25%, y: 17.5%..85%) with horizontal grid-line removal + 2x upscale
       const sX = Math.round(W * 0.098);
       const sY = Math.round(H * 0.175);
-      const sW = Math.max(40, Math.round(W * 0.132));
-      const sH = Math.max(100, Math.round(H * 0.575));
+      const sW = Math.max(40, Math.round(W * 0.15));
+      const sH = Math.max(100, Math.round(H * 0.65));
 
       const sbdBin = new Uint8Array(sW * sH);
       for (let y = 0; y < sH; y++) {
@@ -208,10 +208,10 @@ async function prepareTableColumnCrops(dataUrl: string): Promise<{
         sbdCropUrl = sbdCanvas.toDataURL("image/png");
       }
 
-      // 2. Score Column Crop (x: 23.2%..37.5%, y: 17.5%..75%) isolating Red/Blue ink
-      const cX = Math.round(W * 0.232);
+      // 2. Score Column Crop (x: 24%..44%, y: 17.5%..85%) isolating Red/Blue ink
+      const cX = Math.round(W * 0.24);
       const cY = Math.round(H * 0.175);
-      const cW = Math.max(40, Math.round(W * 0.14));
+      const cW = Math.max(40, Math.round(W * 0.18));
       const cH = sH;
       const scoreMask = new Uint8Array(cW * cH);
 
@@ -292,24 +292,18 @@ async function prepareTableColumnCrops(dataUrl: string): Promise<{
 }
 
 /**
- * Matches a noisy OCR SBD token (e.g. "K6.025", "K626", "6.046", "K048") to the canonical knownSbds list.
+ * Matches a noisy OCR SBD or Mã Phách token (e.g. "A40", "K6.025", "K9.001") to the canonical knownCodes list.
  */
-function matchSbdTokenToKnownIndex(
+function matchCodeTokenToKnownIndex(
   rawToken: string,
-  knownSbds: string[]
+  knownCodes: string[]
 ): number {
-  const cleaned = rawToken
-    .toUpperCase()
-    .replace(/O/g, "0")
-    .replace(/[IL]/g, "1")
-    .replace(/S/g, "5")
-    .replace(/[^A-Z0-9]/g, "");
-
+  const cleaned = normalizeSbdClient(rawToken).replace(/[^A-Z0-9]/g, "");
   if (!cleaned) return -1;
 
-  // 1. Exact canonical match (e.g. "K6025")
-  for (let i = 0; i < knownSbds.length; i++) {
-    if (canonicalSbdKey(knownSbds[i]) === cleaned) {
+  // 1. Exact canonical match (e.g. "A40" or "K6025")
+  for (let i = 0; i < knownCodes.length; i++) {
+    if (canonicalSbdKey(knownCodes[i]) === cleaned) {
       return i;
     }
   }
@@ -318,19 +312,8 @@ function matchSbdTokenToKnownIndex(
   const trailing3 = cleaned.match(/(\d{3})$/);
   if (trailing3) {
     const suffix = trailing3[1];
-    for (let i = 0; i < knownSbds.length; i++) {
-      if (canonicalSbdKey(knownSbds[i]).endsWith(suffix)) {
-        return i;
-      }
-    }
-  }
-
-  // 3. Match if 2-digit suffix like "K626" -> "026"
-  const k2Match = cleaned.match(/^K6(\d{2})$/);
-  if (k2Match) {
-    const suffix3 = `0${k2Match[1]}`;
-    for (let i = 0; i < knownSbds.length; i++) {
-      if (canonicalSbdKey(knownSbds[i]).endsWith(suffix3)) {
+    for (let i = 0; i < knownCodes.length; i++) {
+      if (canonicalSbdKey(knownCodes[i]).endsWith(suffix)) {
         return i;
       }
     }
@@ -340,20 +323,25 @@ function matchSbdTokenToKnownIndex(
 }
 
 /**
- * Runs Local Browser OCR using Column-Cropped Grid-Line Removal + Known-SBD Sequence Alignment.
+ * Runs Local Browser OCR using Column-Cropped Grid-Line Removal + Known-Code Sequence Alignment.
+ * Supports both direct SBD sheets and Mã Phách sheets (via phachToSbdMap).
  */
 export async function runLocalBrowserOcr(params: {
   images: Array<{ name: string; mimeType: string; dataUrl: string }>;
   knownSbds: string[];
+  phachToSbdMap?: Record<string, string>;
   onProgress?: (statusText: string, percent: number) => void;
 }): Promise<OcrRecord[]> {
-  const { images, knownSbds, onProgress } = params;
+  const { images, knownSbds, phachToSbdMap, onProgress } = params;
   const results: OcrRecord[] = [];
+
+  const knownPhachs = phachToSbdMap ? Object.keys(phachToSbdMap) : [];
+  const activeKnownCodes = knownPhachs.length > 0 ? knownPhachs : knownSbds;
 
   for (let imgIdx = 0; imgIdx < images.length; imgIdx++) {
     const img = images[imgIdx];
     onProgress?.(
-      `Đang tách cột SBD & Điểm trên bảng (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      `Đang tách cột Mã Phách / SBD & Điểm trên bảng (${imgIdx + 1}/${images.length}): ${img.name}...`,
       20
     );
 
@@ -364,11 +352,11 @@ export async function runLocalBrowserOcr(params: {
     const worker = await Tesseract.createWorker("eng");
     await worker.setParameters({
       tessedit_pageseg_mode: "6" as any,
-      tessedit_char_whitelist: "K0123456789.,",
+      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,-",
     });
 
     onProgress?.(
-      `Đang đọc cột SBD trên phiếu (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      `Đang đọc cột Mã Phách / SBD (${imgIdx + 1}/${images.length}): ${img.name}...`,
       50
     );
     const sbdRes = await worker.recognize(sbdCropUrl);
@@ -378,13 +366,13 @@ export async function runLocalBrowserOcr(params: {
       tessedit_char_whitelist: "0123456789.,",
     });
     onProgress?.(
-      `Đang đọc cột Điểm trên phiếu (${imgIdx + 1}/${images.length}): ${img.name}...`,
+      `Đang đọc cột Điểm (${imgIdx + 1}/${images.length}): ${img.name}...`,
       80
     );
     const scoreRes = await worker.recognize(scoreCropUrl);
     await worker.terminate();
 
-    const rawSbdLines = (sbdRes.data.text || "")
+    const rawCodeLines = (sbdRes.data.text || "")
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter((l) => l.length >= 2);
@@ -394,12 +382,11 @@ export async function runLocalBrowserOcr(params: {
       .map((l) => l.trim())
       .filter(Boolean);
 
-    // Align detected SBD lines to a contiguous block in knownSbds if available
-    let alignedSbds: string[] = [];
-    if (knownSbds.length > 0 && rawSbdLines.length >= 3) {
+    let alignedCodes: string[] = [];
+    if (activeKnownCodes.length > 0 && rawCodeLines.length >= 2) {
       const offsets: number[] = [];
-      rawSbdLines.forEach((line, rowIdx) => {
-        const matchedIdx = matchSbdTokenToKnownIndex(line, knownSbds);
+      rawCodeLines.forEach((line, rowIdx) => {
+        const matchedIdx = matchCodeTokenToKnownIndex(line, activeKnownCodes);
         if (matchedIdx >= 0) {
           offsets.push(matchedIdx - rowIdx);
         }
@@ -412,27 +399,27 @@ export async function runLocalBrowserOcr(params: {
           offsets[Math.floor(offsets.length / 2)]
         );
         const rowCount = Math.min(
-          Math.max(rawSbdLines.length, 24),
+          Math.max(rawCodeLines.length, 24),
           25,
-          knownSbds.length - startOffset
+          activeKnownCodes.length - startOffset
         );
         for (let r = 0; r < rowCount; r++) {
-          alignedSbds.push(normalizeSbdClient(knownSbds[startOffset + r]));
+          alignedCodes.push(normalizeSbdClient(activeKnownCodes[startOffset + r]));
         }
       }
     }
 
-    if (alignedSbds.length === 0) {
-      for (const line of rawSbdLines) {
-        if (knownSbds.length > 0) {
-          const idx = matchSbdTokenToKnownIndex(line, knownSbds);
+    if (alignedCodes.length === 0) {
+      for (const line of rawCodeLines) {
+        if (activeKnownCodes.length > 0) {
+          const idx = matchCodeTokenToKnownIndex(line, activeKnownCodes);
           if (idx >= 0) {
-            alignedSbds.push(normalizeSbdClient(knownSbds[idx]));
+            alignedCodes.push(normalizeSbdClient(activeKnownCodes[idx]));
           }
         } else {
           const norm = normalizeSbdClient(line);
-          if (/^[A-Z]\d\.\d{3,4}$/.test(norm)) {
-            alignedSbds.push(norm);
+          if (/^[A-Z]{1,3}\d\.?\d{1,4}$/.test(norm)) {
+            alignedCodes.push(norm);
           }
         }
       }
@@ -446,20 +433,28 @@ export async function runLocalBrowserOcr(params: {
       }
     }
 
-    for (let r = 0; r < alignedSbds.length; r++) {
-      const sbd = alignedSbds[r];
+    for (let r = 0; r < alignedCodes.length; r++) {
+      const code = alignedCodes[r];
       const scoreVal = parsedScores[r] ?? null;
       if (scoreVal !== null) {
+        const mappedSbd =
+          phachToSbdMap?.[code] ||
+          phachToSbdMap?.[canonicalSbdKey(code)] ||
+          code;
+        const isPhach = mappedSbd !== code || Boolean(phachToSbdMap?.[code]);
         const rawText = String(scoreVal).replace(".", ",");
         results.push({
           id: `local-${img.name}-${r}-${Date.now()}`,
-          sbd,
-          rawSbd: sbd,
+          sbd: mappedSbd,
+          rawSbd: code,
+          maPhach: isPhach ? code : undefined,
           score: scoreVal,
           rawScoreText: rawText,
           scoreInWords: "",
           confidence: "TRUNG_BINH",
-          notes: `Trích xuất Local OCR (${rawText} → ${scoreVal})`,
+          notes: isPhach
+            ? `Khớp Mã phách ${code} → SBD ${mappedSbd} (${rawText} → ${scoreVal})`
+            : `Trích xuất Local OCR (${rawText} → ${scoreVal})`,
           sourceImage: img.name,
         });
       }
@@ -471,11 +466,12 @@ export async function runLocalBrowserOcr(params: {
 }
 
 /**
- * Parses bulk pasted text or table rows (e.g. "K6.001 8,5" or a list of scores corresponding to Excel SBDs)
+ * Parses bulk pasted text or table rows (e.g. "A40 8", "A41 8,50", or "K9.001 8,5")
  */
 export function parseBulkPastedScores(
   rawPaste: string,
-  knownSbds: string[]
+  knownSbds: string[],
+  phachToSbdMap?: Record<string, string>
 ): OcrRecord[] {
   const lines = rawPaste
     .split(/\r?\n/)
@@ -487,24 +483,35 @@ export function parseBulkPastedScores(
   lines.forEach((line, idx) => {
     const parts = line.split(/[\t;|-]+|\s{2,}|\s+/);
     if (parts.length >= 2) {
-      const possibleSbd = normalizeSbdClient(parts[0]);
+      const possibleCode = normalizeSbdClient(parts[0]);
       const rawScoreStr = parts[parts.length - 1];
       const parsedScore = parseVietnameseScoreClient(rawScoreStr);
 
       if (
-        possibleSbd &&
+        possibleCode &&
         parsedScore !== null &&
-        /[A-Z0-9]{3,}/.test(possibleSbd)
+        /[A-Z0-9]{2,}/.test(possibleCode)
       ) {
+        const canonCode = canonicalSbdKey(possibleCode);
+        const mappedSbd =
+          phachToSbdMap?.[possibleCode] ||
+          phachToSbdMap?.[canonCode] ||
+          possibleCode;
+        const isPhach =
+          mappedSbd !== possibleCode || Boolean(phachToSbdMap?.[possibleCode]);
+
         records.push({
           id: `paste-${idx}-${Date.now()}`,
-          sbd: possibleSbd,
+          sbd: mappedSbd,
           rawSbd: parts[0],
+          maPhach: isPhach ? possibleCode : undefined,
           score: parsedScore,
           rawScoreText: rawScoreStr,
           scoreInWords: "",
           confidence: "CAO",
-          notes: `Dán nhanh: "${rawScoreStr}" → ${parsedScore}`,
+          notes: isPhach
+            ? `Dán nhanh Mã phách ${possibleCode} → SBD ${mappedSbd}: "${rawScoreStr}" → ${parsedScore}`
+            : `Dán nhanh: "${rawScoreStr}" → ${parsedScore}`,
           sourceImage: "Dán hàng loạt",
         });
         return;

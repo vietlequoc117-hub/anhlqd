@@ -17,6 +17,16 @@ function normalizeSbd(raw) {
       .replace(/S/g, "5");
     return `.${fixed}`;
   });
+  s = s.replace(/^([A-Z]{1,3})([0-9OILS]{1,5})$/, (_, prefix, digits) => {
+    if (/[0-9O]/.test(digits)) {
+      const fixed = digits
+        .replace(/O/g, "0")
+        .replace(/[IL]/g, "1")
+        .replace(/S/g, "5");
+      return `${prefix}${fixed}`;
+    }
+    return `${prefix}${digits}`;
+  });
   return s;
 }
 
@@ -35,13 +45,31 @@ function parseVietnameseScore(raw) {
     const intVal = Math.round(val);
     const tokenStr = rawToken ? rawToken.replace(/[^0-9]/g, "") : String(intVal);
 
-    if (intVal === 100) return 10;
+    if (intVal === 100 || intVal === 1000) return 10;
+
+    // 4-digit number where the 2nd digit is '1' (tall comma stroke in 2-decimal score, e.g., 8150 -> 8.5)
+    if (tokenStr.length === 4 && tokenStr[1] === "1") {
+      const d1 = parseInt(tokenStr[0], 10);
+      const dec = parseInt(tokenStr.slice(2), 10);
+      const converted = d1 + dec / 100;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
 
     // 3-digit number where the middle digit is '1' (tall comma stroke, e.g., 813 -> 8.3, 710 -> 7.0)
     if (tokenStr.length === 3 && tokenStr[1] === "1") {
       const d1 = parseInt(tokenStr[0], 10);
       const d3 = parseInt(tokenStr[2], 10);
       const converted = d1 + d3 / 10;
+      if (converted >= 0 && converted <= 10) {
+        return Math.round(converted * 100) / 100;
+      }
+    }
+
+    // 3-digit integer 101..999 on a 10-point grading sheet (e.g., 850 -> 8.5, 725 -> 7.25)
+    if (intVal >= 101 && intVal <= 999) {
+      const converted = intVal / 100;
       if (converted >= 0 && converted <= 10) {
         return Math.round(converted * 100) / 100;
       }
@@ -121,7 +149,7 @@ export default async function handler(req, res) {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
-    const { images, knownSbds } = body;
+    const { images, knownSbds, phachToSbdMap } = body;
 
     if (!images || !Array.isArray(images) || images.length === 0) {
       return res.status(400).json({ error: "Vui lòng tải lên ít nhất 1 ảnh phiếu chấm." });
@@ -157,6 +185,17 @@ export default async function handler(req, res) {
       }
     }
 
+    const phachMap = new Map();
+    if (phachToSbdMap && typeof phachToSbdMap === "object") {
+      for (const [pKey, sVal] of Object.entries(phachToSbdMap)) {
+        const normP = normalizeSbd(pKey);
+        const canonP = canonicalSbdKey(pKey);
+        const normS = normalizeSbd(sVal);
+        if (normP && normS) phachMap.set(normP, normS);
+        if (canonP && normS) phachMap.set(canonP, normS);
+      }
+    }
+
     const extractedRecords = [];
 
     for (const img of images) {
@@ -185,16 +224,20 @@ export default async function handler(req, res) {
                   },
                   {
                     text: `Bạn là chuyên gia OCR bảng điểm và "PHIẾU CHẤM BÀI THI" tại Việt Nam.
-Hãy đọc TOÀN BỘ TẤT CẢ CÁC DÒNG từ dòng đầu tiên đến dòng cuối cùng trong bảng của bức ảnh này (bảng thường có từ 20 đến 35 dòng thí sinh, TUYỆT ĐỐI KHÔNG ĐƯỢC DỪNG Ở 5 DÒNG ĐẦU).
+Hãy đọc TOÀN BỘ TẤT CẢ CÁC DÒNG từ dòng đầu tiên đến dòng cuối cùng trong bảng của bức ảnh này (bảng có thể có 5, 20, 25 hoặc 35+ dòng, TUYỆT ĐỐI KHÔNG ĐƯỢC DỪNG Ở 5 DÒNG ĐẦU).
 
 QUY TẮC BẮT BUỘC:
-1. Trích xuất ĐẦY ĐỦ 100% các dòng có SBD trong bảng (ví dụ từ STT 1 đến STT 24/25/30...). Không bỏ sót bất kỳ dòng nào!
-2. Cột "SBD" (Số báo danh): Đọc chính xác chuỗi ký tự in đậm (ví dụ: "K6.001", "K6.025", "K6.048", "K6.087"...).
+1. Trích xuất ĐẦY ĐỦ 100% các dòng có ghi điểm trong bảng. Bỏ qua các dòng mà cả cột MÃ PHÁCH/SBD và cột ĐIỂM BẰNG SỐ đều để trống (ví dụ thí sinh vắng thi).
+2. Cột mã định danh bài thi (có tiêu đề là "SBD" hoặc "MÃ PHÁCH"):
+   - Nếu bảng dùng cột "MÃ PHÁCH" (ví dụ: "A40", "A41", "A42", "A43", "B01"...), trả về chính xác mã phách đó vào trường "rawSbd" và "maPhach".
+   - Nếu bảng dùng cột "SBD" (ví dụ: "K6.001", "K6.025", "K9.001"...), trả về chính xác SBD đó vào trường "rawSbd".
+   - Nếu bảng có cả 2 cột "SBD" và "MÃ PHÁCH", trả về cả hai tương ứng.
 3. Cột "ĐIỂM BẰNG SỐ" (thường viết tay bằng mực đỏ hoặc xanh):
    - Chú ý đặc trưng chữ viết tay giáo viên Việt Nam:
+     + Điểm nguyên hoặc có 2 chữ số thập phân như "8", "8,50", "8,5", "7,25": đọc chính xác thành 8, 8.5, 8.5, 7.25.
      + Dấu phẩy "," viết tay nhanh bằng bút đỏ rất hay kéo dài thành nét sổ dọc giống chữ số "1" hoặc "|". Ví dụ: điểm "8,3" nhìn giống "813" hoặc "8|3"; điểm "7,0" nhìn giống "710"; điểm "8,0" nhìn giống "810"; điểm "7,8" nhìn giống "718"; điểm "8,8" nhìn giống "818"; điểm "8,5" nhìn giống "815"; điểm "6,3" nhìn giống "613". Hãy hiểu đó là số thập phân trong thang điểm 0-10 (8.3, 7.0, 8.0, 7.8, 8.8, 8.5, 6.3).
-     + Đôi khi giáo viên viết nhanh quên dấu phẩy: "65" nghĩa là 6.5, "83" nghĩa là 8.3.
-     + Nếu trong ô có điểm bị gạch xóa ở bên trái và điểm viết lại ở bên phải (ví dụ: "6,8" bị gạch xóa và bên cạnh viết "6,3" hoặc "613"), BẮT BUỘC lấy điểm viết lại hợp lệ ở bên phải (6.3).
+     + Đôi khi giáo viên viết nhanh quên dấu phẩy: "65" nghĩa là 6.5, "83" nghĩa là 8.3, "850" nghĩa là 8.50 (8.5).
+     + Nếu trong ô có điểm bị gạch xóa ở bên trái và điểm viết lại ở bên phải (ví dụ: "6,8" bị gạch xóa và bên cạnh viết "6,3"), BẮT BUỘC lấy điểm viết lại hợp lệ ở bên phải (6.3).
 4. Quy đổi chuẩn xác sang số thực dấu chấm động (float) nằm trong khoảng từ 0.0 đến 10.0.
 5. Trả về danh sách JSON theo thứ tự từ trên xuống dưới.`,
                   },
@@ -212,15 +255,19 @@ QUY TẮC BẮT BUỘC:
                         properties: {
                           rawSbd: {
                             type: Type.STRING,
-                            description: "SBD nguyên bản đọc được từ ảnh (VD: K6.025)",
+                            description: "Mã SBD hoặc Mã Phách nguyên bản đọc được từ ảnh (VD: A40, A41, K9.001, K6.025)",
+                          },
+                          maPhach: {
+                            type: Type.STRING,
+                            description: "Mã phách nếu cột trên phiếu là MÃ PHÁCH (VD: A40, A41)",
                           },
                           rawScoreText: {
                             type: Type.STRING,
-                            description: "Chuỗi điểm viết tay nguyên bản đọc được (VD: 8,5)",
+                            description: "Chuỗi điểm viết tay nguyên bản đọc được (VD: 8, 8,50, 8,5)",
                           },
                           normalizedScore: {
                             type: Type.NUMBER,
-                            description: "Điểm số thực từ 0.0 đến 10.0 sau khi quy đổi dấu phẩy thành dấu chấm (VD: 8.5)",
+                            description: "Điểm số thực từ 0.0 đến 10.0 sau khi quy đổi dấu phẩy thành dấu chấm (VD: 8, 8.5)",
                           },
                           scoreInWords: {
                             type: Type.STRING,
@@ -265,12 +312,25 @@ QUY TẮC BẮT BUỘC:
       }
 
       for (const item of parsedRows) {
-        let sbdNorm = normalizeSbd(item.rawSbd);
-        if (!sbdNorm) continue;
+        let codeNorm = normalizeSbd(item.rawSbd || item.maPhach);
+        if (!codeNorm) continue;
 
-        const canon = canonicalSbdKey(sbdNorm);
+        const canon = canonicalSbdKey(codeNorm);
         if (canon && knownCanonicalMap.has(canon)) {
-          sbdNorm = knownCanonicalMap.get(canon);
+          codeNorm = knownCanonicalMap.get(canon);
+        }
+
+        let detectedPhach = normalizeSbd(item.maPhach || "");
+        let finalSbd = codeNorm;
+
+        // Check if codeNorm or detectedPhach maps to an SBD via phachToSbdMap (Hình 2)
+        if (phachMap.has(codeNorm) || phachMap.has(canon)) {
+          detectedPhach = codeNorm;
+          finalSbd = phachMap.get(codeNorm) || phachMap.get(canon);
+        } else if (detectedPhach && (phachMap.has(detectedPhach) || phachMap.has(canonicalSbdKey(detectedPhach)))) {
+          finalSbd =
+            phachMap.get(detectedPhach) ||
+            phachMap.get(canonicalSbdKey(detectedPhach));
         }
 
         let finalScore = null;
@@ -290,9 +350,10 @@ QUY TẮC BẮT BUỘC:
         if (finalScore === null) continue;
 
         extractedRecords.push({
-          id: `${sbdNorm}-${Math.random().toString(36).slice(2, 7)}`,
-          sbd: sbdNorm,
-          rawSbd: item.rawSbd || sbdNorm,
+          id: `${finalSbd}-${Math.random().toString(36).slice(2, 7)}`,
+          sbd: finalSbd,
+          rawSbd: item.rawSbd || codeNorm,
+          maPhach: detectedPhach || (finalSbd !== codeNorm ? codeNorm : undefined),
           score: finalScore,
           rawScoreText: String(item.rawScoreText || finalScore),
           scoreInWords: item.scoreInWords || "",
@@ -302,7 +363,10 @@ QUY TẮC BẮT BUỘC:
             item.confidence === "CAN_KIEM_TRA"
               ? item.confidence
               : "CAO",
-          notes: item.notes || "Đã chuẩn hóa dấu ',' -> '.'",
+          notes:
+            detectedPhach && finalSbd !== detectedPhach
+              ? `Khớp Mã phách ${detectedPhach} → SBD ${finalSbd} (${item.rawScoreText} → ${finalScore})`
+              : item.notes || `Chuẩn hóa (${item.rawScoreText} → ${finalScore})`,
           sourceImage: img.name,
         });
       }
