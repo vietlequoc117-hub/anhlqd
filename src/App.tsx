@@ -1572,7 +1572,7 @@ export default function App() {
                           htmlFor="step1-score-col"
                           className="text-[11px] font-semibold text-blue-900 block mb-1"
                         >
-                          Cột Điểm Cần Điền (Hình 4):
+                          Cột Điểm Cần Điền:
                         </label>
                         <select
                           id="step1-score-col"
@@ -1665,7 +1665,7 @@ export default function App() {
                           htmlFor="step1-phach-sbd-col"
                           className="text-[11px] font-semibold text-amber-900 block mb-1"
                         >
-                          Cột SBD (Hình 2):
+                          Cột SBD:
                         </label>
                         <select
                           id="step1-phach-sbd-col"
@@ -1686,7 +1686,7 @@ export default function App() {
                           htmlFor="step1-phach-code-col"
                           className="text-[11px] font-semibold text-indigo-900 block mb-1"
                         >
-                          Cột MÃ PHÁCH (Hình 2):
+                          Cột MÃ PHÁCH:
                         </label>
                         <select
                           id="step1-phach-code-col"
@@ -1729,7 +1729,7 @@ export default function App() {
                                 </th>
                                 {h.colLetter === sbdCol && phachExcelData && (
                                   <th className="py-2 px-3 whitespace-nowrap bg-indigo-50 text-indigo-900 border-x border-indigo-200">
-                                    MÃ PHÁCH (Khớp Hình 2)
+                                    MÃ PHÁCH
                                   </th>
                                 )}
                               </React.Fragment>
@@ -1786,7 +1786,7 @@ export default function App() {
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div>
                 <h1 className="text-xl font-bold text-slate-900">
-                  02. Tải File PDF / Ảnh Phiếu Chấm (Hình 3) &amp; Xuất File Excel (Hình 4)
+                  02. Tải File PDF / Ảnh Phiếu Chấm &amp; Xuất File Excel
                 </h1>
               </div>
 
@@ -1940,7 +1940,7 @@ export default function App() {
                     <div className="my-auto text-center p-8 space-y-4">
                       <ScanText className="w-8 h-8 text-slate-400 mx-auto" />
                       <div className="text-xs text-slate-500 max-w-xs mx-auto">
-                        Tải lên file PDF (gộp nhiều trang phiếu chấm) hoặc ảnh chụp Phiếu Chấm Bài Thi (Hình 3).
+                        Tải lên file PDF (gộp nhiều trang phiếu chấm) hoặc ảnh chụp Phiếu Chấm Bài Thi.
                       </div>
                       <button
                         type="button"
